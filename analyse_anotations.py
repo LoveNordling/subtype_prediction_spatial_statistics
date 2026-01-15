@@ -37,7 +37,7 @@ pathologist_names = ["patrick", "niclos", "fredrik_heldin", "gordan"]
 
 # All evaluators (humans + models)
 names = [
-    #"patrick", "niclos", "fredrik_heldin", "gordan",
+    "patrick", "niclos", "fredrik_heldin", "gordan",
     "cellprofiler_spatial_metrics_model",
     "cellpose_spatial_metrics_model",
     "inform_spatial_metrics_model",

@@ -119,6 +119,47 @@ def preprocess_cellpose_data(data):
     print(f"[INFO] Loaded {len(data)} cells from component file.")
     return data[["x", "y", "Cancer", "sample_name", "ck_cyto_mean_raw"]]
 
+def preprocess_external_cells(bomi1_cells: pd.DataFrame) -> pd.DataFrame:
+    """
+    Standardize BOMI1_cells_all.csv to the columns expected by the spatial pipeline.
+    - x, y: coordinates in microns (already correct to use)
+    - Cancer: 1 if 'Class' == 'Neoplastic', else 0
+    - sample_name: already present in your file
+    """
+    df = bomi1_cells.copy()
+    if not {"CentroidX_um", "CentroidY_um", "Class", "sample_name"}.issubset(df.columns):
+        missing = {"CentroidX_um", "CentroidY_um", "Class", "sample_name"} - set(df.columns)
+        raise ValueError(f"External cells file missing columns: {missing}")
+
+    df = df.rename(columns={"CentroidX_um": "x", "CentroidY_um": "y"})
+    # Make robust to capitalization/whitespace
+    df["Cancer"] = (df["Class"].astype(str).str.strip().str.lower() == "neoplastic").astype(int)
+
+    # Keep only the required columns
+    df = df[["x", "y", "Cancer", "sample_name"]].dropna()
+    # Ensure numeric x,y
+    df["x"] = pd.to_numeric(df["x"], errors="coerce")
+    df["y"] = pd.to_numeric(df["y"], errors="coerce")
+    df = df.dropna(subset=["x", "y"])
+    return df
+
+def split_external_meta(meta_df: pd.DataFrame):
+    """
+    From clinical_data_and_cores_adenovsSQ.csv create:
+      - patients_df: one row per patient with ['ID', 'label']
+      - samples_df: mapping of samples to patients ['ID', 'sample_name']
+    """
+    needed = {"ID", "sample_name", "label"}
+    if not needed.issubset(meta_df.columns):
+        missing = needed - set(meta_df.columns)
+        raise ValueError(f"External meta file missing columns: {missing}")
+
+    # One label per patient
+    patients_df = meta_df[["ID", "label"]].drop_duplicates(subset=["ID"]).copy()
+
+    # Sample map has NO label (avoid merge collision)
+    samples_df = meta_df[["ID", "sample_name"]].drop_duplicates(subset=["ID", "sample_name"]).copy()
+    return patients_df, samples_df
 
 def preprocess_cellproflier_data(data):
     """
@@ -200,13 +241,6 @@ def preprocess_cells(data):
     print("num cells after dropping na", len(data))
     print(data.columns)
     ### Use CK positivity as cancer marker
-    
-    otsu_thresh = threshold_otsu(data["PanCK"].to_numpy())#.dropna().to_numpy())
-    print("otsu: ", otsu_thresh)
-    print("How many otsu thresholded ck is correct", sum((data["PanCK"] > otsu_thresh).astype(int) == data["CK"])/len(data["CK"]))
-    cut, panck_01 = panck_min_valley(data, "PanCK")
-    print("cut:", cut)
-    print("How many cut thresholded ck is correct", sum(panck_01 == data["CK"])/len(data["CK"]))
     
     data["Cancer"] = data["CK"]
     return data
@@ -322,14 +356,14 @@ def get_or_compute_all_metrics(all_patients_df, samples_df, cells_df, recompute=
     
     if recompute or not os.path.exists(filename):
         print("Computing spatial metrics for all samples...")
-        if cellprofiler:
+        """if cellprofiler:
             print("computing ck cutoff")
             cut, panck_01 = panck_min_valley(cells_df, "Intensity_MeanIntensity_CK")
             cells_df["cancer"] = panck_01
         elif cellpose:
             print("computing ck cutoff")
             cut, panck_01 = panck_min_valley(cells_df, "ck_cyto_mean_raw")
-            cells_df["cancer"] = panck_01
+            cells_df["cancer"] = panck_01"""
         all_metrics = filter_and_analyze_data(all_patients_df, samples_df, cells_df)
         all_metrics.to_csv(filename, index=False)
     else:
@@ -386,49 +420,6 @@ def filter_and_analyze_data(patients_df, samples_df, cells_df, n_jobs=None):
 
 
 
-#def filter_and_analyze_data(patients_df, samples_df, cells_df):
-"""
-Filter data to training set and analyze spatial patterns
-"""
-"""   # Merge patient info with samples
-    patients_samples = pd.merge(patients_df, samples_df, on='ID')
-    
-    # Prepare data container for results
-    results = []
-    ### REMOVE
-    #patients_samples = patients_samples.head(20)
-    # Process each sample
-
-    for _, sample_row in tqdm(patients_samples.iterrows(), total=len(patients_samples)):
-        patient_id = sample_row['ID']
-        sample_name = sample_row['sample_name']
-        label = sample_row["label"]
-        
-        # Filter cells for this sample
-        sample_cells = cells_df[(cells_df['sample_name'] == sample_name)]
-        
-        if len(sample_cells) < 10:
-            continue
-        
-        # Calculate spatial metrics
-        
-        metrics = calculate_spatial_metrics_for_sample(sample_cells)
-        
-        if metrics is not None:
-            
-            # Add patient info
-            metrics['ID'] = patient_id
-            metrics['sample_name'] = sample_name
-            #metrics['LUAD'] = sample_row['LUAD']
-            #metrics['Tumor_type_code'] = sample_row['Tumor_type_code']
-            metrics['label'] = sample_row['label']
-            results.append(metrics)
-
-
-    # Convert to DataFrame
-    results_df = pd.DataFrame(results)
-    return results_df
-"""
 def run_correlation_analysis(results_df):
     """
     Run correlation analysis between spatial metrics and cancer type
@@ -825,6 +816,89 @@ def evaluate_on_test_set(results_df_train, results_df_test, pipeline, feature_na
     }
 
 
+def evaluate_external_cohort(
+    external_cells_path: str = "BOMI1_cells_all.csv",
+        external_meta_path: str = "BOMI1_clinical_data_LUADvsSqCC.csv",
+    recompute_internal_metrics: bool = False,
+    cellprofiler: bool = False,
+    cellpose: bool = True,
+):
+    """
+    1) Train/Select model on the internal BOMI2 cohort (as the script already does)
+    2) Compute spatial metrics on the external BOMI1 cohort
+    3) Evaluate the trained pipeline on the external cohort
+    """
+
+    # === 1) INTERNAL TRAINING (same as your main()) ===
+    cells_data, samples_data, all_patients, patients_train, patients_test = load_and_preprocess_all(cellprofiler, cellpose)
+    all_results = get_or_compute_all_metrics(all_patients, samples_data, cells_data, recompute_internal_metrics, cellprofiler, cellpose)
+    all_results_merged = merge_samples(all_results)
+
+    # Clean up known unnecessary features that can be 0-distance bins
+    for col in ["cancer_ripley_L_0.0", "stroma_ripley_L_0.0"]:
+        all_results_merged.drop(columns=col, errors='ignore', inplace=True)
+
+    # Respect the static split from the internal cohort
+    train_ids = set(patients_train["ID"])
+    test_ids = set(patients_test["ID"])
+
+    results_df_train = all_results_merged[all_results_merged["ID"].isin(train_ids)].copy()
+    results_df_internal_test = all_results_merged[all_results_merged["ID"].isin(test_ids)].copy()
+
+    # Model selection + CV on internal TRAIN
+    print("Running model selection / CV on internal cohort...")
+    auc, std_auc, acc, std_acc, feature_imp, model_name, pipeline, _, best_params = run_classification_cv(
+        results_df_train, return_model=True
+    )
+    print(f"[INTERNAL] {model_name} CV AUC: {auc:.3f} ± {std_auc:.3f}, Acc: {acc:.3f} ± {std_acc:.3f}")
+
+    # Optional: show internal test split performance (sanity check)
+    internal_test_eval = evaluate_on_test_set(results_df_train, results_df_internal_test, pipeline)
+    print(f"[INTERNAL HOLDOUT] AUC: {internal_test_eval['auc']:.3f}, Acc: {internal_test_eval['accuracy']:.3f}")
+
+    # === 2) EXTERNAL METRICS ===
+    print("Loading external cohort...")
+    ext_cells_raw = pd.read_csv(external_cells_path)
+    ext_meta_raw  = pd.read_csv(external_meta_path)
+
+    ext_cells = preprocess_external_cells(ext_cells_raw)
+    ext_patients_df, ext_samples_df = split_external_meta(ext_meta_raw)
+
+    # Compute spatial metrics per sample (external)
+    print("Computing spatial metrics for external cohort...")
+
+    metrics_file = "external_spatial_metrics_BOMI1.csv"
+    if os.path.exists(metrics_file):
+        print(f"Loading precomputed external metrics from {metrics_file}")
+        ext_results_per_sample = pd.read_csv(metrics_file)
+    else:
+        print("Computing spatial metrics for external cohort...")
+        ext_results_per_sample = filter_and_analyze_data(ext_patients_df, ext_samples_df, ext_cells)
+        ext_results_per_sample.to_csv(metrics_file, index=False)
+        print(f"Saved computed external metrics to {metrics_file}")
+    
+    if ext_results_per_sample.empty:
+        raise RuntimeError("No external samples produced metrics. Check sample_name matching and Cancer mapping.")
+
+    # Merge to per-patient (weighted by cell_count)
+    ext_results_merged = merge_samples(ext_results_per_sample)
+
+    # === 3) EVALUATE TRAINED PIPELINE ON EXTERNAL ===
+    print("Evaluating trained internal model on external cohort...")
+    external_eval = evaluate_on_test_set(results_df_train, ext_results_merged, pipeline)
+
+    print(f"[EXTERNAL] AUC: {external_eval['auc']:.3f}")
+    print(f"[EXTERNAL] Acc: {external_eval['accuracy']:.3f}")
+
+    # Optionally save per-patient predictions for external cohort
+    out = pd.DataFrame({
+        "ID": ext_results_merged["ID"],
+        "y_true": ext_results_merged["label"],
+        "y_prob": external_eval["y_probs"],
+        "y_pred": external_eval["y_pred"],
+    })
+    out.to_csv("external_BOMI1_predictions.csv", index=False)
+    print("Saved external predictions to external_BOMI1_predictions.csv")
 
 
 def select_non_redundant_features(results_df, label_col='label', corr_threshold=0.9, top_n=20):
@@ -875,7 +949,7 @@ def select_non_redundant_features(results_df, label_col='label', corr_threshold=
 
 
     
-def main(recompute_metrics=False, cellprofiler=False, cellpose=True):
+def main(recompute_metrics=False, cellprofiler=False, cellpose=False):
     # Load and preprocess
     cells_data, samples_data, all_patients, patients_train, patients_test = load_and_preprocess_all(cellprofiler, cellpose)
 
@@ -928,4 +1002,11 @@ def main(recompute_metrics=False, cellprofiler=False, cellpose=True):
 
     print("All done!")
 if __name__ == "__main__":
-    main()
+    #main()
+    evaluate_external_cohort(
+        external_cells_path="BOMI1_cells_all.csv",
+        external_meta_path="BOMI1_clinical_data_LUADvsSqCC.csv",
+        recompute_internal_metrics=False,  # change to True if you want to recompute internal metrics
+        cellprofiler=True,
+        cellpose=False
+    )

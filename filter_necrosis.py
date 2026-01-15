@@ -7,6 +7,7 @@ import re
 import matplotlib.pyplot as plt
 #import cv2
 from skimage.filters import threshold_otsu
+from scipy.stats import pearsonr, spearmanr, chisquare, gaussian_kde
 from tqdm import tqdm
 
 # ----------------- Paths -----------------
@@ -16,6 +17,35 @@ output_csv = '/media/love/Love Extern/Output_Cells_NotInsideMasks.csv'
 vis_output_dir = "tissue_plots"  # Save visualizations here
 
 # ----------------- Helper Functions -----------------
+
+
+
+def panck_min_valley(data: pd.DataFrame, column: str = "PanCK", grid: int = 2048):
+    s = pd.to_numeric(data[column], errors="coerce")
+    x = s.dropna().to_numpy(float)
+    assert x.size >= 10, "Need at least 10 values"
+
+    otsu = float(threshold_otsu(x))
+
+    # KDE over all values
+    xs = np.linspace(x.min(), x.max(), grid)
+    kde_all = gaussian_kde(x)
+    ys = kde_all(xs)
+
+    # Peaks on each side of Otsu
+    left_mask = xs < otsu
+    right_mask = xs > otsu
+    if left_mask.sum() < 3 or right_mask.sum() < 3:
+        cut = otsu
+    else:
+        peak1 = xs[left_mask][np.argmax(ys[left_mask])]
+        peak2 = xs[right_mask][np.argmax(ys[right_mask])]
+        between = (xs > peak1) & (xs < peak2)
+        cut = otsu if not between.any() else float(xs[between][np.argmin(ys[between])])
+
+    binary = (s >= cut).fillna(0).astype("uint8")
+    return cut, binary
+
 
 def extract_identifier(filename):
     """Extracts image identifier from filename using regex"""
@@ -73,9 +103,9 @@ def visualize_mask_and_cells(mask, all_cells, kept_cells, image_id, out_path):
 
 # Load CSV
 df = pd.read_csv(csv_path)
-otsu_thresh = threshold_otsu(df["Intensity_MeanIntensity_CK"].dropna().to_numpy())
-df["CK"] = (df["Intensity_MeanIntensity_CK"] >= otsu_thresh).astype(int)
-print(f"Otsu threshold = {otsu_thresh}")
+#otsu_thresh = threshold_otsu(df["Intensity_MeanIntensity_CK"].dropna().to_numpy())
+#df["CK"] = (df["Intensity_MeanIntensity_CK"] >= otsu_thresh).astype(int)
+#print(f"Otsu threshold = {otsu_thresh}")
 
 # Extract image identifier
 df['ImageID'] = df['FileName_CK'].apply(extract_identifier)
@@ -121,6 +151,11 @@ for image_id, group in tqdm(df.groupby('ImageID')):
     #visualize_mask_and_cells(mask, group, filtered_group, image_id, vis_path)
 
 # Combine and save filtered cells
+
 result_df = pd.concat(filtered_groups, ignore_index=True)
+
+cut, panck_01 = panck_min_valley(result_df, "Intensity_MeanIntensity_CK")
+result_df["CK"] = panck_01
+            
 result_df.to_csv(output_csv, index=False)
 print(f"\n✅ Saved filtered cells to:\n{output_csv}")
