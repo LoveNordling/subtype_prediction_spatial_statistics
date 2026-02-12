@@ -44,6 +44,34 @@ import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as _mp
 
+
+from sklearn.exceptions import ConvergenceWarning
+import warnings
+
+
+
+def _passes_count_qc(sample_cells_df: pd.DataFrame, min_total: int, min_cancer: int, min_stroma: int):
+    """
+    Return (pass_bool, qc_dict) where qc_dict contains counts for logging/debugging.
+
+    Expects sample_cells_df to have a 'Cancer' column with 0/1.
+    """
+    if sample_cells_df is None or sample_cells_df.empty:
+        return False, {"n_total": 0, "n_cancer": 0, "n_stroma": 0}
+
+    ct = sample_cells_df["Cancer"].to_numpy()
+    # Be strict: enforce binary
+    ct = np.asarray(ct, dtype=int)
+
+    n_total = int(ct.size)
+    n_cancer = int((ct == 1).sum())
+    n_stroma = int((ct == 0).sum())
+
+    ok = (n_total >= int(min_total)) and (n_cancer >= int(min_cancer)) and (n_stroma >= int(min_stroma))
+    return ok, {"n_total": n_total, "n_cancer": n_cancer, "n_stroma": n_stroma}
+
+
+
 def _compute_one_sample(ID, sample_name, label, sample_cells_df):
     """Worker: compute metrics for a single sample and attach identifiers."""
     if sample_cells_df is None or len(sample_cells_df) < 10:
@@ -66,7 +94,9 @@ def load_and_preprocess_all(cellprofiler=False, cellpose=False):
         cells_data = preprocess_cellproflier_data(cells_data)
     elif cellpose:
         print("[INFO] Using cellpose file input...")
+        #cells_data = pd.read_csv("cellpose_extracted_cells_fitlered_necrosis__matchedBOMI1.csv")#
         cells_data = pd.read_csv("./cellpose_extracted_cells_fitlered_necrosis.csv")
+        #cells_data = pd.read_csv("./cellpose_extracted_cells.csv")
         cells_data = preprocess_cellpose_data(cells_data)
     else:
         cells_data = pd.read_csv(cells_path)
@@ -246,6 +276,52 @@ def preprocess_cells(data):
     return data
 
 
+def _prefix_ids(df: pd.DataFrame, prefix: str, id_col: str = "ID") -> pd.DataFrame:
+    """
+    Return a copy of df where ID is coerced to string and prefixed.
+    Useful to avoid accidental ID collisions between cohorts.
+    """
+    if id_col not in df.columns:
+        raise ValueError(f"Expected column '{id_col}' in dataframe. Columns: {list(df.columns)}")
+    out = df.copy()
+    out[id_col] = out[id_col].astype(str).map(lambda x: f"{prefix}{x}")
+    return out
+
+
+def _read_split_ids(csv_path: str) -> set:
+    """
+    Read a split CSV and return a set of patient IDs.
+
+    Supports a few common column names to avoid brittle coupling.
+    """
+    df = pd.read_csv(csv_path)
+    for col in ["ID", "ID or PAD_year", "ID_or_PAD_year", "patient_id", "Patient ID"]:
+        if col in df.columns:
+            return set(df[col].dropna().astype(str))
+    raise ValueError(
+        f"Could not find an ID column in {csv_path}. Columns: {list(df.columns)}"
+    )
+
+
+def _subset_by_ids(df: pd.DataFrame, ids: set) -> pd.DataFrame:
+    """Subset df on df['ID'] using a string-based match for robustness."""
+    if "ID" not in df.columns:
+        raise ValueError(f"Expected column 'ID' in df. Columns: {list(df.columns)}")
+    ids_str = {str(x) for x in ids}
+    return df[df["ID"].astype(str).isin(ids_str)].copy()
+
+
+def _save_predictions(path: str, test_df: pd.DataFrame, eval_dict: dict):
+    out = pd.DataFrame({
+        "ID": test_df["ID"].astype(str),
+        "y_true": test_df["label"].values,
+        "y_prob": eval_dict["y_probs"],
+        "y_pred": eval_dict["y_pred"],
+    })
+    out.to_csv(path, index=False)
+    print(f"Saved predictions to {path}")
+
+
 def panck_min_valley(data: pd.DataFrame, column: str = "PanCK", grid: int = 2048):
     s = pd.to_numeric(data[column], errors="coerce")
     x = s.dropna().to_numpy(float)
@@ -356,14 +432,6 @@ def get_or_compute_all_metrics(all_patients_df, samples_df, cells_df, recompute=
     
     if recompute or not os.path.exists(filename):
         print("Computing spatial metrics for all samples...")
-        """if cellprofiler:
-            print("computing ck cutoff")
-            cut, panck_01 = panck_min_valley(cells_df, "Intensity_MeanIntensity_CK")
-            cells_df["cancer"] = panck_01
-        elif cellpose:
-            print("computing ck cutoff")
-            cut, panck_01 = panck_min_valley(cells_df, "ck_cyto_mean_raw")
-            cells_df["cancer"] = panck_01"""
         all_metrics = filter_and_analyze_data(all_patients_df, samples_df, cells_df)
         all_metrics.to_csv(filename, index=False)
     else:
@@ -374,7 +442,21 @@ def get_or_compute_all_metrics(all_patients_df, samples_df, cells_df, recompute=
 
 # Main analysis script
 
-def filter_and_analyze_data(patients_df, samples_df, cells_df, n_jobs=None):
+#def filter_and_analyze_data(patients_df, samples_df, cells_df, n_jobs=None):
+
+def filter_and_analyze_data(
+    patients_df,
+    samples_df,
+    cells_df,
+    n_jobs=None,
+    # NEW: fixed-count QC thresholds
+    min_total_cells: int = 1500,
+    min_cancer_cells: int = 30,
+    min_stroma_cells: int = 30,
+    # NEW: logging
+    verbose_qc: bool = True,
+):
+
     """
     Filter data to training set and analyze spatial patterns — parallel across samples.
     """
@@ -392,18 +474,61 @@ def filter_and_analyze_data(patients_df, samples_df, cells_df, n_jobs=None):
     }
 
     # Build task list (skip samples with no cells)
-    tasks = []
-    for _, row in patients_samples.iterrows():
-        sname = row['sample_name']
-        if sname not in cell_groups:
-            continue
-        tasks.append((
-            row['ID'],
-            sname,
-            row['label'],
-            cell_groups[sname]
-        ))
 
+    # Build task list with QC filtering
+    tasks = []
+    qc_rows = []  # optional QC report
+
+    for _, row in patients_samples.iterrows():
+        sname = row["sample_name"]
+        if sname not in cell_groups:
+            if verbose_qc:
+                qc_rows.append({
+                    "ID": row["ID"],
+                    "sample_name": sname,
+                    "label": row["label"],
+                    "qc_pass": False,
+                    "qc_reason": "no_cells_for_sample",
+                    "n_total": 0,
+                    "n_cancer": 0,
+                    "n_stroma": 0,
+                })
+            continue
+
+        sample_cells = cell_groups[sname]
+
+        ok, counts = _passes_count_qc(
+            sample_cells,
+            min_total=min_total_cells,
+            min_cancer=min_cancer_cells,
+            min_stroma=min_stroma_cells,
+        )
+
+        if not ok:
+            if verbose_qc:
+                qc_rows.append({
+                    "ID": row["ID"],
+                    "sample_name": sname,
+                    "label": row["label"],
+                    "qc_pass": False,
+                    "qc_reason": "below_cell_count_thresholds",
+                    **counts,
+                })
+            continue
+
+        if verbose_qc:
+            qc_rows.append({
+                "ID": row["ID"],
+                "sample_name": sname,
+                "label": row["label"],
+                "qc_pass": True,
+                "qc_reason": "",
+                **counts,
+            })
+
+        tasks.append((row["ID"], sname, row["label"], sample_cells))
+
+        
     results = []
     if not tasks:
         return pd.DataFrame()
@@ -415,6 +540,20 @@ def filter_and_analyze_data(patients_df, samples_df, cells_df, n_jobs=None):
             res = f.result()
             if res is not None:
                 results.append(res)
+
+
+
+    if verbose_qc:
+        qc_df = pd.DataFrame(qc_rows)
+        if not qc_df.empty:
+            kept = int(qc_df["qc_pass"].sum())
+            total = int(len(qc_df))
+            print(f"[QC] Kept {kept}/{total} cores after count thresholds "
+                  f"(min_total={min_total_cells}, min_cancer={min_cancer_cells}, min_stroma={min_stroma_cells})")
+
+            # Optional: save QC table for reproducibility
+            qc_df.to_csv("qc_core_counts.csv", index=False)
+            print("[QC] Saved qc_core_counts.csv")
 
     return pd.DataFrame(results)
 
@@ -509,6 +648,77 @@ def analyze_feature_correlations(results_df, output_file="feature_correlations.p
     return corr_matrix
 
 
+
+def _pixel_area_to_mm2(area_pixels: pd.Series, pixel_size_um: float) -> pd.Series:
+    pixel_size_mm = float(pixel_size_um) * 1e-3
+    return pd.to_numeric(area_pixels, errors="coerce") * (pixel_size_mm * pixel_size_mm)
+
+
+def _build_external_area_map(bomi1_area_csv: str, pixel_size_um: float = 0.5) -> dict:
+    df = pd.read_csv(bomi1_area_csv)
+    needed = {"sample_name", "tissue_area_pixels"}
+    missing = needed - set(df.columns)
+    if missing:
+        raise ValueError(f"External area CSV missing columns: {missing}. Columns: {list(df.columns)}")
+
+    df = df.copy()
+    df["sample_name"] = df["sample_name"].astype(str)
+    df["area_mm2"] = _pixel_area_to_mm2(df["tissue_area_pixels"], pixel_size_um=pixel_size_um)
+    
+
+    # In case of duplicates, aggregate safely
+    area_map = df.groupby("sample_name", sort=False)["area_mm2"].mean().to_dict()
+    return area_map
+
+
+def _build_internal_area_map(samples_df: pd.DataFrame, pixel_size_um: float = 0.5) -> dict:
+    if "sample_name" not in samples_df.columns or "total_area" not in samples_df.columns:
+        raise ValueError(f"Internal samples_df missing sample_name/total_area. Columns: {list(samples_df.columns)}")
+
+    df = samples_df.copy()
+    df["sample_name"] = df["sample_name"].astype(str)
+    df["total_area"] = pd.to_numeric(df["total_area"], errors="coerce")
+    df["area_mm2"] =  _pixel_area_to_mm2(df["mask_area_pixels"], pixel_size_um=pixel_size_um)
+    
+    area_map = df.groupby("sample_name", sort=False)["area_mm2"].mean().to_dict()
+    return area_map
+
+
+def _filter_metrics_by_area(
+    metrics_df: pd.DataFrame,
+    area_map: dict,
+    min_area_mm2: float,
+    cohort_name: str,
+    keep_missing: bool = True,
+) -> pd.DataFrame:
+    if metrics_df.empty:
+        return metrics_df
+    if "sample_name" not in metrics_df.columns:
+        raise ValueError(f"{cohort_name} metrics_df has no 'sample_name' column. Columns: {list(metrics_df.columns)}")
+
+    out = metrics_df.copy()
+    out["__area_mm2"] = out["sample_name"].astype(str).map(area_map)
+
+    n_missing = int(out["__area_mm2"].isna().sum())
+    if n_missing > 0:
+        print(f"[WARN] {cohort_name}: {n_missing}/{len(out)} samples missing area. "
+              f"{'Keeping' if keep_missing else 'Dropping'} missing-area rows.")
+
+    if keep_missing:
+        keep_mask = out["__area_mm2"].isna() | (out["__area_mm2"] >= float(min_area_mm2))
+    else:
+        keep_mask = (out["__area_mm2"] >= float(min_area_mm2))
+
+    before = len(out)
+    out = out.loc[keep_mask].copy()
+    after = len(out)
+
+    print(f"[INFO] {cohort_name}: area filter >= {min_area_mm2} mm^2 kept {after}/{before} cores/samples.")
+    return out
+
+
+
+
 def visualize_spatial_patterns(cells_df, sample_name, patient_id, metric_name=None, metric_value=None):
     """
     Create visualization of cancer vs non-cancer cells for a specific sample
@@ -596,11 +806,13 @@ def visualize_per_cell_centrality(sample_cells, radius=50):
 
 
 cells_path = "BOMI2_all_cells_TIL.csv"
-samples_path = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples.csv"
-
+#samples_path = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples.csv"
+samples_path = "../BOMI2_TIL_masks/samples.csv"
+samples_path = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples__cellpose_matchedBOMI1.csv"
 
 patients_train = pd.read_csv("../multiplex_dataset/lung_cancer_BOMI2_dataset/binary_subtype_prediction_ACvsSqCC/static_split/train_val.csv")
 patients_test = pd.read_csv("../multiplex_dataset/lung_cancer_BOMI2_dataset/binary_subtype_prediction_ACvsSqCC/static_split/test.csv")
+
 """
 patients_train = pd.read_csv("../multiplex_dataset/lung_cancer_BOMI2_dataset/binary_survival_prediction/static_split/train_val.csv")
 patients_test = pd.read_csv("../multiplex_dataset/lung_cancer_BOMI2_dataset/binary_survival_prediction/static_split/test.csv")
@@ -610,6 +822,7 @@ patients_test = pd.read_csv("../multiplex_dataset/lung_cancer_BOMI2_dataset/bina
 #cells_data = preprocess_cells(cells_data)
 
 #patient_data = preprocess_patients(patient_data)
+
 """
 sample = cells_data[cells_data['sample_name'].str.contains("1_\[1,E")]
 example_sample_name = sample["sample_name"].iloc[0]
@@ -663,11 +876,7 @@ def run_classification_cv(results_df, n_folds=5, hyperparameter_tuning=True, ret
                 'model__penalty': ['l2'],
                 'model__solver': ['saga']
             }),
-            'LinearSVC': (LinearSVC(random_state=42, dual=False, max_iter=10000), {
-                'model__C': [0.01, 0.1, 1, 10, 100],
-                'model__penalty': ['l2'],
-                'model__loss': ['squared_hinge']
-            }),
+
         }
 
         best_pipeline, best_model_name, best_score, best_params = None, None, -np.inf, None
@@ -690,7 +899,7 @@ def run_classification_cv(results_df, n_folds=5, hyperparameter_tuning=True, ret
 
             # Build pipeline
             pipeline = Pipeline([
-                ('scaler', MinMaxScaler()),#RobustScaler()),#StandardScaler()),
+                ('scaler', MinMaxScaler()),#StandardScaler()),#RobustScaler()),#),
                 #('smote', SMOTE(random_state=42)),  # Add SMOTE here
                 ('oversample', RandomOverSampler(random_state=42)),
                 ('selector', selector),
@@ -818,45 +1027,76 @@ def evaluate_on_test_set(results_df_train, results_df_test, pipeline, feature_na
 
 def evaluate_external_cohort(
     external_cells_path: str = "BOMI1_cells_all.csv",
-        external_meta_path: str = "BOMI1_clinical_data_LUADvsSqCC.csv",
+    external_meta_path: str = "BOMI1_clinical_data_LUADvsSqCC.csv",
+    external_split_dir: str = "/home/love/multiplex_dataset/lung_cancer_BOMI1_dataset/HE_dataset/binary_subtype_prediction_ACvsSqCC/static_split/",
+    external_train_csv: str = None,
+    external_test_csv: str = None,
     recompute_internal_metrics: bool = False,
     cellprofiler: bool = False,
     cellpose: bool = True,
+    # NEW (area filtering)
+    external_area_csv: str = "../BOMI1_TMA/BOMI1_tissue_area_per_core.csv",
+    min_core_area_mm2: float = 0.5,
+    pixel_size_um: float = 0.5,
+    filter_internal_cores: bool = False,
+    filter_external_cores: bool = False,
 ):
     """
-    1) Train/Select model on the internal BOMI2 cohort (as the script already does)
-    2) Compute spatial metrics on the external BOMI1 cohort
-    3) Evaluate the trained pipeline on the external cohort
+    Runs symmetric internal/external experiments:
+
+    1. CV on internal train
+    2. Train internal train, test internal test
+    3. Train internal train, test external test
+
+    4. CV on external train
+    5. Train external train, test external test
+    6. Train external train, test internal test
+
+    7. Train combined (internal train + external train), test internal test
+    8. Train combined (internal train + external train), test external test
     """
 
-    # === 1) INTERNAL TRAINING (same as your main()) ===
+    # Resolve external split files
+    if external_train_csv is None:
+        external_train_csv = os.path.join(external_split_dir, "train_val.csv")
+    if external_test_csv is None:
+        external_test_csv = os.path.join(external_split_dir, "test.csv")
+
+    # === Load internal cohort and compute/merge metrics (unchanged) ===
     cells_data, samples_data, all_patients, patients_train, patients_test = load_and_preprocess_all(cellprofiler, cellpose)
     all_results = get_or_compute_all_metrics(all_patients, samples_data, cells_data, recompute_internal_metrics, cellprofiler, cellpose)
+
+
+    if (min_core_area_mm2 is not None) and filter_internal_cores:
+        internal_area_map = _build_internal_area_map(samples_data)
+        
+        all_results = _filter_metrics_by_area(
+            all_results,
+            internal_area_map,
+            min_area_mm2=min_core_area_mm2,
+            cohort_name="INTERNAL/BOMI2",
+            keep_missing=True,
+        )
+        all_results.drop(columns=["__area_mm2"], inplace=True)
+
+    
     all_results_merged = merge_samples(all_results)
 
-    # Clean up known unnecessary features that can be 0-distance bins
     for col in ["cancer_ripley_L_0.0", "stroma_ripley_L_0.0"]:
-        all_results_merged.drop(columns=col, errors='ignore', inplace=True)
+        all_results_merged.drop(columns=col, errors="ignore", inplace=True)
 
-    # Respect the static split from the internal cohort
-    train_ids = set(patients_train["ID"])
-    test_ids = set(patients_test["ID"])
+    train_ids_internal = set(patients_train["ID"].astype(str))
+    test_ids_internal = set(patients_test["ID"].astype(str))
 
-    results_df_train = all_results_merged[all_results_merged["ID"].isin(train_ids)].copy()
-    results_df_internal_test = all_results_merged[all_results_merged["ID"].isin(test_ids)].copy()
+    results_df_train_int = _subset_by_ids(all_results_merged, train_ids_internal)
+    results_df_test_int  = _subset_by_ids(all_results_merged, test_ids_internal)
 
-    # Model selection + CV on internal TRAIN
-    print("Running model selection / CV on internal cohort...")
-    auc, std_auc, acc, std_acc, feature_imp, model_name, pipeline, _, best_params = run_classification_cv(
-        results_df_train, return_model=True
-    )
-    print(f"[INTERNAL] {model_name} CV AUC: {auc:.3f} ± {std_auc:.3f}, Acc: {acc:.3f} ± {std_acc:.3f}")
+    print(len(train_ids_internal), len(test_ids_internal))
+    print(len(all_results_merged))
+    print(len(results_df_train_int), len(results_df_test_int))
 
-    # Optional: show internal test split performance (sanity check)
-    internal_test_eval = evaluate_on_test_set(results_df_train, results_df_internal_test, pipeline)
-    print(f"[INTERNAL HOLDOUT] AUC: {internal_test_eval['auc']:.3f}, Acc: {internal_test_eval['accuracy']:.3f}")
-
-    # === 2) EXTERNAL METRICS ===
+    
+    # === Load external cohort, compute/merge metrics (mostly unchanged) ===
     print("Loading external cohort...")
     ext_cells_raw = pd.read_csv(external_cells_path)
     ext_meta_raw  = pd.read_csv(external_meta_path)
@@ -864,9 +1104,8 @@ def evaluate_external_cohort(
     ext_cells = preprocess_external_cells(ext_cells_raw)
     ext_patients_df, ext_samples_df = split_external_meta(ext_meta_raw)
 
-    # Compute spatial metrics per sample (external)
-    print("Computing spatial metrics for external cohort...")
-
+    ext_cells[["x", "y"]] = ext_cells[["x", "y"]] * 2
+    
     metrics_file = "external_spatial_metrics_BOMI1.csv"
     if os.path.exists(metrics_file):
         print(f"Loading precomputed external metrics from {metrics_file}")
@@ -876,29 +1115,105 @@ def evaluate_external_cohort(
         ext_results_per_sample = filter_and_analyze_data(ext_patients_df, ext_samples_df, ext_cells)
         ext_results_per_sample.to_csv(metrics_file, index=False)
         print(f"Saved computed external metrics to {metrics_file}")
-    
+
     if ext_results_per_sample.empty:
         raise RuntimeError("No external samples produced metrics. Check sample_name matching and Cancer mapping.")
 
-    # Merge to per-patient (weighted by cell_count)
+
+    if (min_core_area_mm2 is not None) and filter_external_cores:
+        print("Filtering minimum cores")
+        print(min_core_area_mm2)
+        external_area_map = _build_external_area_map(external_area_csv, pixel_size_um=pixel_size_um)
+        ext_results_per_sample = _filter_metrics_by_area(
+            ext_results_per_sample,
+            external_area_map,
+            min_area_mm2=min_core_area_mm2,
+            cohort_name="EXTERNAL/BOMI1",
+            keep_missing=True,
+        )
+        ext_results_per_sample.drop(columns=["__area_mm2"], inplace=True)
+
+    
     ext_results_merged = merge_samples(ext_results_per_sample)
+    for col in ["cancer_ripley_L_0.0", "stroma_ripley_L_0.0"]:
+        ext_results_merged.drop(columns=col, errors="ignore", inplace=True)
 
-    # === 3) EVALUATE TRAINED PIPELINE ON EXTERNAL ===
-    print("Evaluating trained internal model on external cohort...")
-    external_eval = evaluate_on_test_set(results_df_train, ext_results_merged, pipeline)
+    # === External static split ===
+    ext_train_ids = _read_split_ids(external_train_csv)
+    ext_test_ids  = _read_split_ids(external_test_csv)
 
-    print(f"[EXTERNAL] AUC: {external_eval['auc']:.3f}")
-    print(f"[EXTERNAL] Acc: {external_eval['accuracy']:.3f}")
+    results_df_train_ext = _subset_by_ids(ext_results_merged, ext_train_ids)
+    results_df_test_ext  = _subset_by_ids(ext_results_merged, ext_test_ids)
+    print(len(ext_train_ids), len(ext_test_ids))
+    print(len(ext_results_merged))
+    print(len(results_df_train_ext), len(results_df_test_ext))
+    
+    if results_df_train_ext.empty or results_df_test_ext.empty:
+        raise RuntimeError(
+            "External split produced empty train or test set. "
+            f"Train rows: {len(results_df_train_ext)}, Test rows: {len(results_df_test_ext)}. "
+            "Verify IDs in split CSVs match IDs in external meta/metrics."
+        )
 
-    # Optionally save per-patient predictions for external cohort
-    out = pd.DataFrame({
-        "ID": ext_results_merged["ID"],
-        "y_true": ext_results_merged["label"],
-        "y_prob": external_eval["y_probs"],
-        "y_pred": external_eval["y_pred"],
-    })
-    out.to_csv("external_BOMI1_predictions.csv", index=False)
-    print("Saved external predictions to external_BOMI1_predictions.csv")
+    # === EXPERIMENTS ===
+
+    # 1) CV on internal train
+    print("\n[1] CV on INTERNAL train...")
+    auc_i, std_auc_i, acc_i, std_acc_i, fi_i, model_name_i, pipeline_i, _, best_params_i = run_classification_cv(
+        results_df_train_int, return_model=True
+    )
+    print(f"[INTERNAL CV] {model_name_i} AUC: {auc_i:.3f} ± {std_auc_i:.3f}, Acc: {acc_i:.3f} ± {std_acc_i:.3f}")
+
+    # 2) Train internal train, test internal test
+    print("\n[2] Train INTERNAL train, test INTERNAL test...")
+    eval_i2i = evaluate_on_test_set(results_df_train_int, results_df_test_int, pipeline_i)
+    print(f"[INTERNAL→INTERNAL] AUC: {eval_i2i['auc']:.3f}, Acc: {eval_i2i['accuracy']:.3f}")
+    _save_predictions("pred_internal_train_to_internal_test.csv", results_df_test_int, eval_i2i)
+
+    # 3) Train internal train, test external test
+    print("\n[3] Train INTERNAL train, test EXTERNAL test...")
+    eval_i2e = evaluate_on_test_set(results_df_train_int, results_df_test_ext, pipeline_i)
+    print(f"[INTERNAL→EXTERNAL] AUC: {eval_i2e['auc']:.3f}, Acc: {eval_i2e['accuracy']:.3f}")
+    _save_predictions("pred_internal_train_to_external_test.csv", results_df_test_ext, eval_i2e)
+
+    # 4) CV on external train
+    print("\n[4] CV on EXTERNAL train...")
+    auc_e, std_auc_e, acc_e, std_acc_e, fi_e, model_name_e, pipeline_e, _, best_params_e = run_classification_cv(
+        results_df_train_ext, return_model=True
+    )
+    print(f"[EXTERNAL CV] {model_name_e} AUC: {auc_e:.3f} ± {std_auc_e:.3f}, Acc: {acc_e:.3f} ± {std_acc_e:.3f}")
+
+    # 5) Train external train, test external test
+    print("\n[5] Train EXTERNAL train, test EXTERNAL test...")
+    eval_e2e = evaluate_on_test_set(results_df_train_ext, results_df_test_ext, pipeline_e)
+    print(f"[EXTERNAL→EXTERNAL] AUC: {eval_e2e['auc']:.3f}, Acc: {eval_e2e['accuracy']:.3f}")
+    _save_predictions("pred_external_train_to_external_test.csv", results_df_test_ext, eval_e2e)
+
+    # 6) Train external train, test internal test
+    print("\n[6] Train EXTERNAL train, test INTERNAL test...")
+    eval_e2i = evaluate_on_test_set(results_df_train_ext, results_df_test_int, pipeline_e)
+    print(f"[EXTERNAL→INTERNAL] AUC: {eval_e2i['auc']:.3f}, Acc: {eval_e2i['accuracy']:.3f}")
+    _save_predictions("pred_external_train_to_internal_test.csv", results_df_test_int, eval_e2i)
+
+    # 7) Train combined train, test internal test
+    print("\n[7] Train COMBINED train (internal+external), test INTERNAL test...")
+    # Prefix external IDs to avoid any ambiguity/collisions in bookkeeping (ID isn't used as a feature).
+    results_df_train_ext_pref = _prefix_ids(results_df_train_ext, prefix="BOMI1_")
+    combined_train = pd.concat([results_df_train_int, results_df_train_ext_pref], ignore_index=True, sort=False)
+
+    eval_c2i = evaluate_on_test_set(combined_train, results_df_test_int, pipeline_i)
+    print(f"[COMBINED→INTERNAL] AUC: {eval_c2i['auc']:.3f}, Acc: {eval_c2i['accuracy']:.3f}")
+    _save_predictions("pred_combined_train_to_internal_test.csv", results_df_test_int, eval_c2i)
+
+    # 8) Train combined train, test external test
+    print("\n[8] Train COMBINED train (internal+external), test EXTERNAL test...")
+    eval_c2e = evaluate_on_test_set(combined_train, results_df_test_ext, pipeline_i)
+    print(f"[COMBINED→EXTERNAL] AUC: {eval_c2e['auc']:.3f}, Acc: {eval_c2e['accuracy']:.3f}")
+    _save_predictions("pred_combined_train_to_external_test.csv", results_df_test_ext, eval_c2e)
+
+    print("\nAll external/internal symmetric experiments completed.")
+
+
 
 
 def select_non_redundant_features(results_df, label_col='label', corr_threshold=0.9, top_n=20):
@@ -1007,6 +1322,6 @@ if __name__ == "__main__":
         external_cells_path="BOMI1_cells_all.csv",
         external_meta_path="BOMI1_clinical_data_LUADvsSqCC.csv",
         recompute_internal_metrics=False,  # change to True if you want to recompute internal metrics
-        cellprofiler=True,
-        cellpose=False
+        cellprofiler=False,
+        cellpose=True
     )
