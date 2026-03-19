@@ -4,7 +4,7 @@ import os
 from tqdm import tqdm
 
 # Read the CSV files
-cell_df = pd.read_csv("cellpose_extracted_cells_fitlered_necrosis.csv")
+cell_df = pd.read_csv("data/interim/cellpose_extracted_cells_fitlered_necrosis.csv")
 samples_df = pd.read_csv("../multiplex_dataset/lung_cancer_BOMI2_dataset/binary_subtype_prediction_ACvsSqCC/samples_labels.csv")
 test_df = pd.read_csv("../multiplex_dataset/lung_cancer_BOMI2_dataset/binary_subtype_prediction_ACvsSqCC/static_split/test.csv")
 
@@ -19,7 +19,7 @@ patient_samples = samples_df[samples_df['ID'].isin(test_df['ID'])].groupby('ID')
 ck_colors = {0: "grey", 1: "red"}
 
 # Create output directory
-output_dir = "patient_figures_cellpose"
+output_dir = "outputs/qc/patient_figures_cellpose"
 os.makedirs(output_dir, exist_ok=True)
 
 for patient_id, sample_list in tqdm(patient_samples.items()):

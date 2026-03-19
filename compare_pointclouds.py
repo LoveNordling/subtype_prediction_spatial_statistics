@@ -25,12 +25,12 @@ Outputs:
 
 Usage:
   python compare_pointclouds_pixels.py \
-    --inform BOMI2_all_cells_TIL.csv \
-    --cellprofiler cellprofiler_extracted_cells_filtered_necrosis.csv \
-    --cellpose cellpose_extracted_cells_fitlered_necrosis.csv \
+    --inform data/raw/BOMI2_all_cells_TIL.csv \
+    --cellprofiler data/interim/cellprofiler_extracted_cells_filtered_necrosis.csv \
+    --cellpose data/interim/cellpose_extracted_cells_fitlered_necrosis.csv \
     --match-radius 12 \
     --assort-radius 50 \
-    --out-prefix comparison_results
+    --out-prefix outputs/comparisons/comparison_results
 """
 
 from __future__ import annotations
@@ -611,6 +611,7 @@ def run_external_vs_internal_density(
     dens_external["cohort"] = "External_BOMI1"
 
     all_dens = pd.concat([dens_internal, dens_external], ignore_index=True)
+    Path(f"{out_prefix}_nnd_metrics.csv").parent.mkdir(parents=True, exist_ok=True)
     all_dens.to_csv(f"{out_prefix}_nnd_metrics.csv", index=False)
 
     return all_dens
@@ -658,6 +659,7 @@ def plot_density_histograms(df, metric, out_png, log_bins=False, n_bins=60, clip
 
     plt.xlabel(metric.replace("_", " "))
     plt.tight_layout()
+    Path(out_png).parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_png, dpi=300)
     plt.close()
 
@@ -671,7 +673,7 @@ def main():
     ap.add_argument("--min-cells", type=int, default=10)
     ap.add_argument("--match-radius", type=float, default=12.0, help="Greedy match radius in pixels.")
     ap.add_argument("--assort-radius", type=float, default=50.0, help="Radius for assortativity graph in pixels.")
-    ap.add_argument("--out-prefix", type=str, default="comparison_results")
+    ap.add_argument("--out-prefix", type=str, default="outputs/comparisons/comparison_results")
     ap.add_argument(
         "--external-vs-internal",
         action="store_true",
@@ -687,10 +689,11 @@ def main():
     ap.add_argument(
         "--external-cells",
         type=str,
-        default="BOMI1_cells_all.csv",
+        default="data/raw/BOMI1_cells_all.csv",
         help="External cohort cell CSV (e.g. BOMI1_cells_all.csv)."
     )
     args = ap.parse_args()
+    Path(args.out_prefix).parent.mkdir(parents=True, exist_ok=True)
 
     internal_paths = {
         "inform": args.inform,
@@ -831,6 +834,7 @@ def main():
         raise RuntimeError("No pairwise rows computed; try lowering --min-cells or check inputs.")
     per_sample_df = pd.DataFrame(rows)
     per_sample_path = f"{args.out_prefix}_per_sample_pairwise.csv"
+    Path(per_sample_path).parent.mkdir(parents=True, exist_ok=True)
     per_sample_df.to_csv(per_sample_path, index=False)
     print(f"Saved per-sample differences: {per_sample_path}")
 
@@ -851,6 +855,7 @@ def main():
     summary_wide = summary_df.pivot(index="metric", columns="pair", values="mean_sd").reset_index()
 
     summary_path = f"{args.out_prefix}_summary_mean_sd.csv"
+    Path(summary_path).parent.mkdir(parents=True, exist_ok=True)
     summary_wide.to_csv(summary_path, index=False)
     print(f"Saved summary (mean ± SD): {summary_path}")
 

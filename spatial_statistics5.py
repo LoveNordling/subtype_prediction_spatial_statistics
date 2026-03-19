@@ -103,7 +103,7 @@ RANDOM_STATE = 42
 @dataclass(frozen=True)
 class InternalPaths:
     # inForm / multiplex IF
-    inform_cells_path: str = "BOMI2_all_cells_TIL.csv"
+    inform_cells_path: str = "data/raw/BOMI2_all_cells_TIL.csv"
     inform_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples.csv"
 
     #inform_cells_path: str = "BOMI2_all_cells_TIL__matchedBOMI1.csv"
@@ -121,7 +121,7 @@ class InternalPaths:
     #cellpose_cells_path: str = "./cellpose_extracted_cells_fitlered_necrosis__matchedBOMI1.csv"
     #cellpose_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples__cellpose_matchedBOMI1.csv"
 
-    cellpose_cells_path: str = "./cellpose_extracted_cells_fitlered_necrosis__matchedBOMI1_separate.csv"
+    cellpose_cells_path: str = "data/interim/cellpose_extracted_cells_fitlered_necrosis__matchedBOMI1_separate.csv"
     cellpose_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples__cellpose_matchedBOMI1_separate.csv"
     
     # Stroma matched
@@ -130,8 +130,9 @@ class InternalPaths:
 
     #cellpose_cells_path: str = "cellpose_extracted_cells_fitlered_necrosis.csv"
     #cellpose_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples.csv"
+    
     # CellProfiler derived cells
-    cellprofiler_cells_path: str = "./cellprofiler_extracted_cells_filtered_necrosis.csv"
+    cellprofiler_cells_path: str = "data/interim/cellprofiler_extracted_cells_filtered_necrosis.csv"
     cellprofiler_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples.csv"
 
     # Splits (internal)
@@ -141,8 +142,8 @@ class InternalPaths:
 
 @dataclass(frozen=True)
 class ExternalPaths:
-    external_cells_path: str = "BOMI1_cells_all.csv"
-    external_meta_path: str = "BOMI1_clinical_data_LUADvsSqCC.csv"
+    external_cells_path: str = "data/raw/BOMI1_cells_all.csv"
+    external_meta_path: str = "data/reference/BOMI1_clinical_data_LUADvsSqCC.csv"
     external_split_dir: str = "/home/love/multiplex_dataset/lung_cancer_BOMI1_dataset/HE_dataset/binary_subtype_prediction_ACvsSqCC/static_split/"
     external_train_csv: Optional[str] = None
     external_test_csv: Optional[str] = None
@@ -271,6 +272,9 @@ def _save_predictions(path: str, test_df: pd.DataFrame, eval_dict: dict) -> None
         "y_prob": eval_dict["y_probs"],
         "y_pred": eval_dict["y_pred"],
     })
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     out.to_csv(path, index=False)
     print(f"[INFO] Saved predictions to {path}")
 
@@ -840,6 +844,9 @@ def get_or_compute_metrics(
                 f"Computed 0 metric rows for {cohort_name}. "
                 "This usually means sample_name mismatch between samples_df and cells_df."
             )
+        metrics_cache_dir = os.path.dirname(metrics_cache_path)
+        if metrics_cache_dir:
+            os.makedirs(metrics_cache_dir, exist_ok=True)
         m.to_csv(metrics_cache_path, index=False)
         print(f"[INFO] Saved metrics: {metrics_cache_path}")
     else:
@@ -877,7 +884,7 @@ def prepare_patient_level_tables(
         internal_paths, source=internal_source
     )
 
-    internal_metrics_path = f"spatial_metrics_{internal_source}.csv"
+    internal_metrics_path = os.path.join("outputs", "metrics", f"spatial_metrics_{internal_source}.csv")
     int_metrics_per_core = get_or_compute_metrics(
         cohort_name=f"INTERNAL/{internal_source}",
         metrics_cache_path=internal_metrics_path,
@@ -909,7 +916,7 @@ def prepare_patient_level_tables(
 
     ext_cells[["x", "y"]] = ext_cells[["x", "y"]] * float(external_xy_scale)
 
-    external_metrics_path = "spatial_metrics_EXTERNAL_BOMI1.csv"
+    external_metrics_path = os.path.join("outputs", "metrics", "spatial_metrics_EXTERNAL_BOMI1.csv")
     ext_metrics_per_core = get_or_compute_metrics(
         cohort_name="EXTERNAL/BOMI1",
         metrics_cache_path=external_metrics_path,
@@ -949,7 +956,7 @@ def run_base_experiments(
     df_test_ext: pd.DataFrame,
     hyperparameter_tuning: bool = True,
     tune_combined: bool = True,
-    fi_dir: str = "feature_importance_bundles",
+    fi_dir: str = os.path.join("outputs", "feature_importance", "feature_importance_bundles"),
 ) -> None:
 
     # Collect summary rows for a compact results CSV requested for the paper.
@@ -990,7 +997,7 @@ def run_base_experiments(
         fi_df=eval_i2i["feature_importance"],
         notes="Permutation importance computed on BOMI2 test set using model trained on BOMI2 train.",
     )
-    _save_predictions("pred_internal_train_to_internal_test.csv", df_test_int, eval_i2i)
+    _save_predictions(os.path.join("outputs", "predictions", "pred_internal_train_to_internal_test.csv"), df_test_int, eval_i2i)
 
     print("\n[3] Train BOMI2 train, test BOMI1 test...")
     eval_i2e = evaluate_on_test_set(df_train_int, df_test_ext, clone(pipe_i))
@@ -1007,7 +1014,7 @@ def run_base_experiments(
         fi_df=eval_i2e["feature_importance"],
         notes="Permutation importance computed on BOMI1 test set using model trained on BOMI2 train.",
     )
-    _save_predictions("pred_internal_train_to_external_test.csv", df_test_ext, eval_i2e)
+    _save_predictions(os.path.join("outputs", "predictions", "pred_internal_train_to_external_test.csv"), df_test_ext, eval_i2e)
 
     # If BOMI1 is not in train, report BOMI1 "train" metrics by evaluating the BOMI2-trained model on the full BOMI1 train set.
     eval_i_on_ext_train = evaluate_fast(df_train_int, df_train_ext, clone(pipe_i))
@@ -1062,7 +1069,7 @@ def run_base_experiments(
         fi_df=eval_e2e["feature_importance"],
         notes="Permutation importance computed on BOMI1 test set using model trained on BOMI1 train.",
     )
-    _save_predictions("pred_external_train_to_external_test.csv", df_test_ext, eval_e2e)
+    _save_predictions(os.path.join("outputs", "predictions", "pred_external_train_to_external_test.csv"), df_test_ext, eval_e2e)
 
     print("\n[6] Train BOMI1 train, test BOMI2 test...")
     eval_e2i = evaluate_on_test_set(df_train_ext, df_test_int, clone(pipe_e))
@@ -1079,7 +1086,7 @@ def run_base_experiments(
         fi_df=eval_e2i["feature_importance"],
         notes="Permutation importance computed on BOMI2 test set using model trained on BOMI1 train.",
     )
-    _save_predictions("pred_external_train_to_internal_test.csv", df_test_int, eval_e2i)
+    _save_predictions(os.path.join("outputs", "predictions", "pred_external_train_to_internal_test.csv"), df_test_int, eval_e2i)
 
     # If BOMI2 is not in train, report BOMI2 "train" metrics by evaluating the BOMI1-trained model on the full BOMI2 train set.
     eval_e_on_int_train = evaluate_fast(df_train_ext, df_train_int, clone(pipe_e))
@@ -1164,7 +1171,7 @@ def run_base_experiments(
         fi_df=eval_c2i["feature_importance"],
         notes="Permutation importance computed on BOMI2 test set using model trained on COMBINED train.",
     )
-    _save_predictions("pred_combined_train_to_internal_test.csv", df_test_int, eval_c2i)
+    _save_predictions(os.path.join("outputs", "predictions", "pred_combined_train_to_internal_test.csv"), df_test_int, eval_c2i)
 
     print("\n[9] Train COMBINED train, test BOMI1 test...")
     eval_c2e = evaluate_on_test_set(combined_train, df_test_ext, clone(pipe_c))
@@ -1181,7 +1188,7 @@ def run_base_experiments(
         fi_df=eval_c2e["feature_importance"],
         notes="Permutation importance computed on BOMI1 test set using model trained on COMBINED train.",
     )
-    _save_predictions("pred_combined_train_to_external_test.csv", df_test_ext, eval_c2e)
+    _save_predictions(os.path.join("outputs", "predictions", "pred_combined_train_to_external_test.csv"), df_test_ext, eval_c2e)
 
     summary_rows.append(
         _make_summary_row(
@@ -1212,7 +1219,8 @@ def run_base_experiments(
         "BOMI1 Test\nAUC",
     ])
 
-    out_csv = "cohort_mixing_summary.csv"
+    out_csv = os.path.join("outputs", "metrics", "cohort_mixing_summary.csv")
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     summary_df.to_csv(out_csv, index=False)
     print(f"\n[SUMMARY] Saved cohort mixing summary to {out_csv}")
 
@@ -1705,7 +1713,12 @@ def build_argparser() -> argparse.ArgumentParser:
     # Modeling
     p.add_argument("--no-hyperparameter-tuning", action="store_true")
     p.add_argument("--no-tune-combined", action="store_true")
-    p.add_argument("--fi-dir", type=str, default="feature_importance_bundles", help="Output directory for feature-importance bundles (CSV+JSON).")
+    p.add_argument(
+        "--fi-dir",
+        type=str,
+        default=os.path.join("outputs", "feature_importance", "feature_importance_bundles"),
+        help="Output directory for feature-importance bundles (CSV+JSON).",
+    )
 
     # Learning curve
     p.add_argument("--run-learning-curve", action="store_true")
@@ -1716,7 +1729,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--learning-tune-folds", type=int, default=5)
     p.add_argument("--learning-train-sizes-internal", type=str, default="")
     p.add_argument("--learning-train-sizes-external", type=str, default="")
-    p.add_argument("--learning-out-dir", type=str, default="learning_curve_out")
+    p.add_argument("--learning-out-dir", type=str, default=os.path.join("outputs", "learning_curves", "learning_curve_out"))
 
     return p
 

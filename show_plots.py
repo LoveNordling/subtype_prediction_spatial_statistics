@@ -12,11 +12,11 @@ from skimage.filters import threshold_otsu
 import cv2
 
 # --------------- CONFIG ---------------
-DF1_PATH = "./cellprofiler_extracted_cells_filtered_necrosis.csv"
-DF2_PATH = "./cellpose_extracted_cells_fitlered_necrosis.csv"
-DF3_PATH = "./BOMI2_all_cells_TIL.csv"
+DF1_PATH = "data/interim/cellprofiler_extracted_cells_filtered_necrosis.csv"
+DF2_PATH = "data/interim/cellpose_extracted_cells_fitlered_necrosis.csv"
+DF3_PATH = "data/raw/BOMI2_all_cells_TIL.csv"
 IMAGE_FOLDER = "/media/love/Love Extern/TESTOUT/"
-OUTPUT_DIR = "tissue_plots_compare"
+OUTPUT_DIR = "outputs/figures/tissue_plots_compare"
 
 # channel indices to keep in the RGB compose (matching your original selection)
 CHANNELS = [0, 1, 2, 3, 4, 6]

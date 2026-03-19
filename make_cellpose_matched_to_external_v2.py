@@ -585,7 +585,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--tol-rel", type=float, default=0.03)
     parser.add_argument("--out-cells", type=Path, required=True)
     parser.add_argument("--out-samples", type=Path, required=True)
-    parser.add_argument("--qc-dir", type=Path, default=Path("qc_matched_internal"))
+    parser.add_argument("--qc-dir", type=Path, default=Path("outputs/qc/qc_matched_internal"))
     parser.add_argument("--keep-all-columns", action="store_true")
     return parser
 
