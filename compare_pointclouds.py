@@ -51,7 +51,7 @@ from spatial_metrics import (
     calculate_newmans_assortativity,
 )
 
-from spatial_statistics import preprocess_external_cells
+from spatial_utils import preprocess_external_cells
 import seaborn as sns
 import matplotlib.pyplot as plt
 
@@ -128,6 +128,16 @@ def load_cellpose(path: Path) -> pd.DataFrame:
     df["y"] = pd.to_numeric(df["y"], errors="coerce")
     df = df.dropna(subset=["x","y"])
     return df[["sample_name","x","y","CK"]]
+
+
+def load_internal_dataset(path: Path, method: str) -> pd.DataFrame:
+    if method == "inform":
+        return load_inform(path)
+    if method == "cellprofiler":
+        return load_cellprofiler(path)
+    if method == "cellpose":
+        return load_cellpose(path)
+    raise ValueError(f"Unknown internal method: {method}")
 
 
 
@@ -568,14 +578,15 @@ def compute_sample_nnd_metrics(df: pd.DataFrame,
 # Main
 # ---------------------------
 
-def run_external_vs_cellpose_density(
-    cellpose_path: Path,
+def run_external_vs_internal_density(
+    internal_path: Path,
+    internal_method: str,
     external_cells_path: Path,
     out_prefix: str,
 ):
-    # Load cellpose (BOMI2)
-    df_cellpose = load_cellpose(cellpose_path)
-    print(df_cellpose)
+    # Load internal BOMI2 source
+    df_internal = load_internal_dataset(internal_path, internal_method)
+
     # Load external (BOMI1)
     ext_raw = pd.read_csv(external_cells_path)
     df_external = preprocess_external_cells(ext_raw)
@@ -583,23 +594,23 @@ def run_external_vs_cellpose_density(
     df_external[["x", "y"]] = df_external[["x", "y"]] * 2
 
     
-    df_cellpose = thin_cellpose_to_match_external_nnd_calibrated(
+    """df_cellpose = thin_cellpose_to_match_external_nnd_calibrated(
         df_cellpose=df_cellpose,
         df_external=df_external,
         n_subsamples=3,
         min_cells=10,
         seed=0,
-    )
+    )"""
     
     
     # Compute per-sample density metrics
-    dens_cellpose = compute_sample_nnd_metrics(df_cellpose)
+    dens_internal = compute_sample_nnd_metrics(df_internal)
     dens_external = compute_sample_nnd_metrics(df_external)
 
-    dens_cellpose["cohort"] = "Cellpose_BOMI2"
+    dens_internal["cohort"] = f"{internal_method.capitalize()}_BOMI2"
     dens_external["cohort"] = "External_BOMI1"
 
-    all_dens = pd.concat([dens_cellpose, dens_external], ignore_index=True)
+    all_dens = pd.concat([dens_internal, dens_external], ignore_index=True)
     all_dens.to_csv(f"{out_prefix}_nnd_metrics.csv", index=False)
 
     return all_dens
@@ -654,17 +665,24 @@ def plot_density_histograms(df, metric, out_png, log_bins=False, n_bins=60, clip
     
 def main():
     ap = argparse.ArgumentParser(description="Compare marked cell point clouds in pixel units.")
-    ap.add_argument("--inform", type=str, required=True)
-    ap.add_argument("--cellprofiler", type=str, required=True)
-    ap.add_argument("--cellpose", type=str, required=True)
+    ap.add_argument("--inform", type=str)
+    ap.add_argument("--cellprofiler", type=str)
+    ap.add_argument("--cellpose", type=str)
     ap.add_argument("--min-cells", type=int, default=10)
     ap.add_argument("--match-radius", type=float, default=12.0, help="Greedy match radius in pixels.")
     ap.add_argument("--assort-radius", type=float, default=50.0, help="Radius for assortativity graph in pixels.")
     ap.add_argument("--out-prefix", type=str, default="comparison_results")
     ap.add_argument(
-        "--external-vs-cellpose",
+        "--external-vs-internal",
         action="store_true",
-        help="Compare external cohort (BOMI1) vs Cellpose using density histograms only."
+        help="Compare external cohort (BOMI1) vs one BOMI2 internal method using density histograms only."
+    )
+    ap.add_argument(
+        "--internal-method",
+        type=str,
+        default="cellpose",
+        choices=["inform", "cellprofiler", "cellpose"],
+        help="Which BOMI2 internal source to use with --external-vs-internal."
     )
     ap.add_argument(
         "--external-cells",
@@ -674,12 +692,24 @@ def main():
     )
     args = ap.parse_args()
 
+    internal_paths = {
+        "inform": args.inform,
+        "cellprofiler": args.cellprofiler,
+        "cellpose": args.cellpose,
+    }
 
-    if args.external_vs_cellpose:
-        print("[INFO] Running external vs Cellpose density comparison only.")
+    if args.external_vs_internal:
+        internal_path = internal_paths.get(args.internal_method)
+        if not internal_path:
+            raise ValueError(
+                f"--external-vs-internal with --internal-method {args.internal_method} "
+                f"requires the matching input path (--{args.internal_method})."
+            )
+        print(f"[INFO] Running external vs internal density comparison only (internal={args.internal_method}).")
 
-        all_dens = run_external_vs_cellpose_density(
-            cellpose_path=Path(args.cellpose),
+        all_dens = run_external_vs_internal_density(
+            internal_path=Path(internal_path),
+            internal_method=args.internal_method,
             external_cells_path=Path(args.external_cells),
             out_prefix=args.out_prefix,
         )
@@ -727,8 +757,15 @@ def main():
         )
 
 
-        print("[INFO] External vs Cellpose density analysis completed.")
+        print("[INFO] External vs internal density analysis completed.")
         return
+
+    missing = [name for name, path in internal_paths.items() if not path]
+    if missing:
+        raise ValueError(
+            "Default three-way comparison requires all internal inputs: "
+            "--inform, --cellprofiler, and --cellpose."
+        )
 
     
     print("[1/5] Loading CSVs...")
