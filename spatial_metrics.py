@@ -30,6 +30,9 @@ import scanpy as sc
 from anndata import AnnData
 
 
+RIPLEY_SEED = 42
+
+
 def calculate_ripley_l(coords, cell_types):
     """
     Calculate Ripley's L function for spatial point patterns for a specific cell type.
@@ -69,7 +72,7 @@ def calculate_ripley_l(coords, cell_types):
         max_dist=100,
         n_steps=6,
         mode='L',
-        
+        seed=RIPLEY_SEED,
     )
     
     # Get results

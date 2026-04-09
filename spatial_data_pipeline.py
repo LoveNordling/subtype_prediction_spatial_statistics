@@ -4,6 +4,7 @@ import os
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -23,6 +24,28 @@ from spatial_utils import (
     preprocess_samples,
     split_external_meta,
 )
+
+
+def _sort_metrics_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    sort_cols = [col for col in ["ID", "sample_name", "label"] if col in df.columns]
+    if not sort_cols:
+        return df.reset_index(drop=True)
+
+    return df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+
+
+def _sort_patient_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    sort_cols = [col for col in ["ID", "label"] if col in df.columns]
+    if not sort_cols:
+        return df.reset_index(drop=True)
+
+    return df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
 
 
 def _get_spatial_metric_functions():
@@ -54,22 +77,38 @@ class InternalPaths:
     inform_cells_path: str = "data/raw/BOMI2_all_cells_TIL.csv"
     inform_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples.csv"
 
-    #inform_cells_path: str = "BOMI2_all_cells_TIL__matchedBOMI1.csv"
+    #inform_cells_path: str = "data/interim/BOMI2_all_cells_TIL__matchedBOMI1.csv"
     #inform_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples__inform_matchedBOMI1.csv"
     #inform_cells_path: str = "BOMI2_all_cells_TIL__matchedBOMI1_stroma.csv"
     #inform_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples__inform_matchedBOMI1_stroma.csv"
-    #inform_cells_path: str = "BOMI2_all_cells_TIL__matchedBOMI1_separate.csv"
+    #inform_cells_path: str = "data/interim/BOMI2_all_cells_TIL__matchedBOMI1_separate.csv"
     #inform_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples__inform_matchedBOMI1_separate.csv"
+    #inform_cells_path: str = "data/interim/BOMI2_all_cells_TIL__matchedBOMI1_separate_2d.csv"
+    #inform_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples__inform_matchedBOMI1_separate_2d.csv"
+    #inform_cells_path: str = "data/interim/BOMI2_all_cells_TIL__matchedBOMI1_separate_3d.csv"
+    #inform_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples__inform_matchedBOMI1_separate_3d.csv"
 
-    #cellpose_cells_path: str = "./cellpose_extracted_cells_fitlered_necrosis__matchedBOMI1.csv"
+
+    
+    #cellpose_cells_path: str = "data/interim/cellpose_extracted_cells_fitlered_necrosis__matchedBOMI1.csv"
     #cellpose_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples__cellpose_matchedBOMI1.csv"
-    cellpose_cells_path: str = "data/interim/cellpose_extracted_cells_fitlered_necrosis__matchedBOMI1_separate.csv"
-    cellpose_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples__cellpose_matchedBOMI1_separate.csv"
+    #cellpose_cells_path: str = "data/interim/cellpose_extracted_cells_fitlered_necrosis__matchedBOMI1_separate.csv"
+    #cellpose_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples__cellpose_matchedBOMI1_separate.csv"
+    #cellpose_cells_path: str = "data/interim/cellpose_extracted_cells_fitlered_necrosis__matchedBOMI1_separate_3d.csv"
+    #cellpose_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples__cellpose_matchedBOMI1_separate_3d.csv"
+    #cellpose_cells_path: str = "data/interim/cellpose_extracted_cells_fitlered_necrosis__matchedBOMI1_separate_2d.csv"
+    #cellpose_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples__cellpose_matchedBOMI1_separate_2d.csv"
+    
     #cellpose_cells_path: str = "cellpose_extracted_cells_fitlered_necrosis__matchedstromaBOMI1.csv"
     #cellpose_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples__cellpose_matchedBOMI1stroma.csv"
-    #cellpose_cells_path: str = "cellpose_extracted_cells_fitlered_necrosis.csv"
-    #cellpose_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples.csv"
+    cellpose_cells_path: str = "data/interim/cellpose_extracted_cells_fitlered_necrosis.csv"
+    cellpose_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples.csv"
 
+    #cellpose_cells_path: str = "data/interim/cellpose_extracted_cells_fitlered_necrosis__matchedBOMI1_featurepanel_quick.csv"
+    #cellpose_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples__cellpose_matchedBOMI1_featurepanel_quick.csv"
+
+
+    
     cellprofiler_cells_path: str = "data/interim/cellprofiler_extracted_cells_filtered_necrosis.csv"
     cellprofiler_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples.csv"
 
@@ -79,7 +118,8 @@ class InternalPaths:
 
 @dataclass(frozen=True)
 class ExternalPaths:
-    external_cells_path: str = "data/raw/BOMI1_cells_all.csv"
+    #external_cells_path: str = "data/raw/BOMI1_cells_all.csv"
+    external_cells_path: str = "data/raw/BOMI1_cells_all_cellvitpp_2026_03_26.csv"
     external_meta_path: str = "data/reference/BOMI1_clinical_data_LUADvsSqCC.csv"
     external_split_dir: str = "/home/love/multiplex_dataset/lung_cancer_BOMI1_dataset/HE_dataset/binary_subtype_prediction_ACvsSqCC/static_split/"
     external_train_csv: Optional[str] = None
@@ -151,7 +191,7 @@ def compute_metrics_for_cohort(
             if res is not None:
                 results.append(res)
 
-    return pd.DataFrame(results)
+    return _sort_metrics_rows(pd.DataFrame(results))
 
 
 def load_internal_dataset(paths: InternalPaths, source: str = "cellpose") -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -159,16 +199,22 @@ def load_internal_dataset(paths: InternalPaths, source: str = "cellpose") -> Tup
         raise ValueError(f"Unknown source: {source}")
 
     if source == "inform":
+        print(f"[INFO] Internal inform cells path: {paths.inform_cells_path}")
+        print(f"[INFO] Internal inform samples path: {paths.inform_samples_path}")
         cells_raw = pd.read_csv(paths.inform_cells_path)
         cells_df = preprocess_cells_inform(cells_raw)
         samples_raw = pd.read_csv(paths.inform_samples_path)
         samples_df = preprocess_samples(samples_raw)
     elif source == "cellpose":
+        print(f"[INFO] Internal cellpose cells path: {paths.cellpose_cells_path}")
+        print(f"[INFO] Internal cellpose samples path: {paths.cellpose_samples_path}")
         cells_raw = pd.read_csv(paths.cellpose_cells_path)
         cells_df = preprocess_cellpose_data(cells_raw)
         samples_raw = pd.read_csv(paths.cellpose_samples_path)
         samples_df = preprocess_samples(samples_raw)
     else:
+        print(f"[INFO] Internal cellprofiler cells path: {paths.cellprofiler_cells_path}")
+        print(f"[INFO] Internal cellprofiler samples path: {paths.cellprofiler_samples_path}")
         cells_raw = pd.read_csv(paths.cellprofiler_cells_path)
         cells_df = preprocess_cellprofiler_data(cells_raw)
         samples_raw = pd.read_csv(paths.cellprofiler_samples_path)
@@ -179,7 +225,31 @@ def load_internal_dataset(paths: InternalPaths, source: str = "cellpose") -> Tup
     patients_train = preprocess_patients(patients_train_raw)
     patients_test = preprocess_patients(patients_test_raw)
     all_patients = pd.concat([patients_train, patients_test], ignore_index=True)
+    print(
+        f"[INFO] Loaded internal dataset: cells samples={cells_df['sample_name'].nunique()} "
+        f"samples rows={len(samples_df)} sample names={samples_df['sample_name'].nunique()} "
+        f"patients={all_patients['ID'].nunique()}"
+    )
     return cells_df, samples_df, all_patients, patients_train, patients_test
+
+
+def infer_internal_metrics_cache_path(paths: InternalPaths, source: str) -> str:
+    default_map = {
+        "inform": "data/raw/BOMI2_all_cells_TIL.csv",
+        "cellpose": "data/interim/cellpose_extracted_cells_fitlered_necrosis.csv",
+        "cellprofiler": "data/interim/cellprofiler_extracted_cells_filtered_necrosis.csv",
+    }
+    cell_path_map = {
+        "inform": paths.inform_cells_path,
+        "cellpose": paths.cellpose_cells_path,
+        "cellprofiler": paths.cellprofiler_cells_path,
+    }
+    cell_path = str(cell_path_map[source])
+    default_cell_path = default_map[source]
+    if os.path.normpath(cell_path) == os.path.normpath(default_cell_path):
+        return os.path.join("outputs", "metrics", f"spatial_metrics_{source}.csv")
+    stem = Path(cell_path).stem
+    return os.path.join("outputs", "metrics", f"spatial_metrics_{stem}.csv")
 
 
 def get_or_compute_metrics(
@@ -213,6 +283,7 @@ def get_or_compute_metrics(
         print(f"[INFO] Loading cached metrics for {cohort_name}: {metrics_cache_path}")
         m = pd.read_csv(metrics_cache_path)
 
+    m = _sort_metrics_rows(m)
     return attach_counts_from_cells(m, cells_df)
 
 
@@ -233,7 +304,7 @@ def prepare_patient_level_tables(
     int_cells, int_samples, int_patients_all, int_patients_train, int_patients_test = load_internal_dataset(
         internal_paths, source=internal_source
     )
-    internal_metrics_path = os.path.join("outputs", "metrics", f"spatial_metrics_{internal_source}.csv")
+    internal_metrics_path = infer_internal_metrics_cache_path(internal_paths, internal_source)
     int_metrics_per_core = get_or_compute_metrics(
         cohort_name=f"INTERNAL/{internal_source}",
         metrics_cache_path=internal_metrics_path,
@@ -243,8 +314,11 @@ def prepare_patient_level_tables(
         recompute=recompute_internal_metrics,
         n_jobs=n_jobs,
     )
+    print(f"[INFO] INTERNAL per-core metric rows before QC: {len(int_metrics_per_core)}")
     int_metrics_per_core = filter_metrics_by_counts(int_metrics_per_core, qc=qc, cohort_name="INTERNAL/BOMI2")
     int_patient_df = aggregate_cores_to_patient(int_metrics_per_core)
+    int_patient_df = _sort_patient_rows(int_patient_df)
+    print(f"[INFO] INTERNAL patient rows after aggregation: {len(int_patient_df)}")
     for col in ["cancer_ripley_L_0.0", "stroma_ripley_L_0.0"]:
         int_patient_df.drop(columns=[col], errors="ignore", inplace=True)
     train_ids_int = set(int_patients_train["ID"].astype(str))
@@ -272,6 +346,7 @@ def prepare_patient_level_tables(
     )
     ext_metrics_per_core = filter_metrics_by_counts(ext_metrics_per_core, qc=qc, cohort_name="EXTERNAL/BOMI1")
     ext_patient_df = aggregate_cores_to_patient(ext_metrics_per_core)
+    ext_patient_df = _sort_patient_rows(ext_patient_df)
     for col in ["cancer_ripley_L_0.0", "stroma_ripley_L_0.0"]:
         ext_patient_df.drop(columns=[col], errors="ignore", inplace=True)
     ext_train_ids = read_split_ids(ext_train_csv)

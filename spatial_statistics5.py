@@ -88,15 +88,15 @@ def set_global_seed(seed: int = RANDOM_STATE) -> None:
 # Modeling
 # ----------------------------
 
-def _build_pipeline(model, selector) -> Pipeline:
-    return Pipeline(
-        [
-            ("scaler", MinMaxScaler()),
-            ("oversample", RandomOverSampler(random_state=RANDOM_STATE)),
-            ("selector", selector),
-            ("model", model),
-        ]
-    )
+def _build_pipeline(model, selector=None) -> Pipeline:
+    steps = [
+        ("scaler", MinMaxScaler()),
+        ("oversample", RandomOverSampler(random_state=RANDOM_STATE)),
+    ]
+    if selector is not None:
+        steps.append(("selector", selector))
+    steps.append(("model", model))
+    return Pipeline(steps)
 
 
 def _tune_best_pipeline(
@@ -104,6 +104,7 @@ def _tune_best_pipeline(
     y: np.ndarray,
     cv,
     use_randomized: bool,
+    use_feature_selection: bool,
 ) -> Tuple[str, Pipeline, dict, float]:
     """Tune RF/GB/SVM/LR, return (best_name, best_estimator, best_params, best_score)."""
 
@@ -157,7 +158,7 @@ def _tune_best_pipeline(
 
     for name, (model, params, selector) in models.items():
         print(f"  Tuning {name}...")
-        pipe = _build_pipeline(model, selector)
+        pipe = _build_pipeline(model, selector if use_feature_selection else None)
 
         search = (
             RandomizedSearchCV(
@@ -195,6 +196,7 @@ def run_classification_cv(
     n_folds: int = 5,
     hyperparameter_tuning: bool = True,
     return_model: bool = True,
+    use_feature_selection: bool = True,
 ) -> Tuple[float, float, float, float, pd.DataFrame, str, Pipeline, dict]:
     if train_df is None or train_df.empty:
         raise ValueError("train_df is empty")
@@ -217,7 +219,13 @@ def run_classification_cv(
         start = time.time()
 
         use_randomized = len(X) > 200
-        best_model_name, best_pipeline, best_params, best_score = _tune_best_pipeline(X, y, cv=cv, use_randomized=use_randomized)
+        best_model_name, best_pipeline, best_params, best_score = _tune_best_pipeline(
+            X,
+            y,
+            cv=cv,
+            use_randomized=use_randomized,
+            use_feature_selection=use_feature_selection,
+        )
 
         print(f"[INFO] Selected model: {best_model_name} (tuning time {time.time() - start:.1f}s)")
     else:
@@ -225,7 +233,9 @@ def run_classification_cv(
         best_params = {}
         best_pipeline = _build_pipeline(
             RandomForestClassifier(n_estimators=200, random_state=RANDOM_STATE),
-            SelectFromModel(RandomForestClassifier(n_estimators=200, random_state=RANDOM_STATE)),
+            SelectFromModel(RandomForestClassifier(n_estimators=200, random_state=RANDOM_STATE))
+            if use_feature_selection
+            else None,
         )
 
     # CV evaluation using the chosen pipeline
@@ -415,6 +425,336 @@ def evaluate_on_test_set(train_df: pd.DataFrame, test_df: pd.DataFrame, pipeline
         "feature_importance": fi,
     }
 
+
+def fit_feature_alignment_meanstd(
+    source_train: pd.DataFrame,
+    target_train: pd.DataFrame,
+    feat_cols: List[str],
+) -> Dict[str, np.ndarray]:
+    src = source_train[feat_cols].to_numpy(float)
+    tgt = target_train[feat_cols].to_numpy(float)
+
+    src_mean = np.nanmean(src, axis=0)
+    tgt_mean = np.nanmean(tgt, axis=0)
+    src_std = np.nanstd(src, axis=0)
+    tgt_std = np.nanstd(tgt, axis=0)
+
+    src_std = np.where(np.isfinite(src_std) & (src_std > 0), src_std, 1.0)
+    tgt_std = np.where(np.isfinite(tgt_std) & (tgt_std > 0), tgt_std, 1.0)
+
+    return {
+        "source_mean": src_mean,
+        "source_std": src_std,
+        "target_mean": tgt_mean,
+        "target_std": tgt_std,
+    }
+
+
+def apply_feature_alignment_meanstd(
+    df: pd.DataFrame,
+    feat_cols: List[str],
+    alignment: Dict[str, np.ndarray],
+) -> pd.DataFrame:
+    out = df.copy()
+    vals = out[feat_cols].to_numpy(float)
+    vals = ((vals - alignment["source_mean"]) / alignment["source_std"]) * alignment["target_std"] + alignment["target_mean"]
+    out.loc[:, feat_cols] = vals
+    return out
+
+
+def fit_feature_alignment_robust_iqr(
+    source_train: pd.DataFrame,
+    target_train: pd.DataFrame,
+    feat_cols: List[str],
+) -> Dict[str, np.ndarray]:
+    src = source_train[feat_cols].to_numpy(float)
+    tgt = target_train[feat_cols].to_numpy(float)
+
+    src_median = np.nanmedian(src, axis=0)
+    tgt_median = np.nanmedian(tgt, axis=0)
+    src_iqr = np.nanpercentile(src, 75, axis=0) - np.nanpercentile(src, 25, axis=0)
+    tgt_iqr = np.nanpercentile(tgt, 75, axis=0) - np.nanpercentile(tgt, 25, axis=0)
+
+    src_iqr = np.where(np.isfinite(src_iqr) & (src_iqr > 0), src_iqr, 1.0)
+    tgt_iqr = np.where(np.isfinite(tgt_iqr) & (tgt_iqr > 0), tgt_iqr, 1.0)
+
+    return {
+        "source_center": src_median,
+        "source_scale": src_iqr,
+        "target_center": tgt_median,
+        "target_scale": tgt_iqr,
+    }
+
+
+def apply_feature_alignment_robust_iqr(
+    df: pd.DataFrame,
+    feat_cols: List[str],
+    alignment: Dict[str, np.ndarray],
+) -> pd.DataFrame:
+    out = df.copy()
+    vals = out[feat_cols].to_numpy(float)
+    vals = ((vals - alignment["source_center"]) / alignment["source_scale"]) * alignment["target_scale"] + alignment["target_center"]
+    out.loc[:, feat_cols] = vals
+    return out
+
+
+def fit_feature_alignment_quantile(
+    source_train: pd.DataFrame,
+    target_train: pd.DataFrame,
+    feat_cols: List[str],
+    *,
+    n_quantiles: int = 201,
+) -> Dict[str, np.ndarray]:
+    src = source_train[feat_cols].to_numpy(float)
+    tgt = target_train[feat_cols].to_numpy(float)
+
+    src_fill = np.nanmedian(src, axis=0)
+    tgt_fill = np.nanmedian(tgt, axis=0)
+    src = np.where(np.isfinite(src), src, src_fill)
+    tgt = np.where(np.isfinite(tgt), tgt, tgt_fill)
+
+    n_quantiles = max(int(n_quantiles), 3)
+    quantile_levels = np.linspace(0.0, 1.0, n_quantiles)
+    source_quantiles = np.quantile(src, quantile_levels, axis=0)
+    target_quantiles = np.quantile(tgt, quantile_levels, axis=0)
+
+    return {
+        "source_quantiles": source_quantiles,
+        "target_quantiles": target_quantiles,
+        "source_fill": src_fill,
+    }
+
+
+def _interp_strict_monotone(x: np.ndarray, xp: np.ndarray, fp: np.ndarray) -> np.ndarray:
+    xp = np.asarray(xp, dtype=float)
+    fp = np.asarray(fp, dtype=float)
+    keep = np.ones(len(xp), dtype=bool)
+    keep[1:] = xp[1:] > xp[:-1]
+    xp = xp[keep]
+    fp = fp[keep]
+    if xp.size == 0:
+        return np.full_like(x, np.nan, dtype=float)
+    if xp.size == 1:
+        return np.full_like(x, fp[0], dtype=float)
+    return np.interp(x, xp, fp, left=fp[0], right=fp[-1])
+
+
+def apply_feature_alignment_quantile(
+    df: pd.DataFrame,
+    feat_cols: List[str],
+    alignment: Dict[str, np.ndarray],
+) -> pd.DataFrame:
+    out = df.copy()
+    vals = out[feat_cols].to_numpy(float)
+    vals = np.where(np.isfinite(vals), vals, alignment["source_fill"])
+
+    aligned = np.empty_like(vals, dtype=float)
+    quantile_levels = np.linspace(0.0, 1.0, alignment["source_quantiles"].shape[0])
+    for idx in range(len(feat_cols)):
+        src_q = alignment["source_quantiles"][:, idx]
+        tgt_q = alignment["target_quantiles"][:, idx]
+        percentiles = _interp_strict_monotone(vals[:, idx], src_q, quantile_levels)
+        aligned[:, idx] = np.interp(percentiles, quantile_levels, tgt_q, left=tgt_q[0], right=tgt_q[-1])
+
+    out.loc[:, feat_cols] = aligned
+    return out
+
+
+def _matrix_square_root_symmetric(
+    matrix: np.ndarray,
+    *,
+    inverse: bool = False,
+    eig_floor: float = 1e-6,
+) -> np.ndarray:
+    evals, evecs = np.linalg.eigh(matrix)
+    evals = np.where(np.isfinite(evals), evals, 0.0)
+    max_eval = float(np.max(evals)) if evals.size else 0.0
+    min_eval = max(max_eval * eig_floor, eig_floor)
+    evals = np.maximum(evals, min_eval)
+    if inverse:
+        scaled = 1.0 / np.sqrt(evals)
+    else:
+        scaled = np.sqrt(evals)
+    return evecs @ np.diag(scaled) @ evecs.T
+
+
+def _regularize_covariance(cov: np.ndarray, shrinkage: float) -> np.ndarray:
+    n_features = cov.shape[0]
+    trace_scale = float(np.trace(cov)) / n_features if n_features else 1.0
+    if not np.isfinite(trace_scale) or trace_scale <= 0:
+        trace_scale = 1.0
+    identity = np.eye(n_features, dtype=float) * trace_scale
+    shrinkage = float(np.clip(shrinkage, 0.0, 1.0))
+    return ((1.0 - shrinkage) * cov) + (shrinkage * identity)
+
+
+def fit_feature_alignment_coral(
+    source_train: pd.DataFrame,
+    target_train: pd.DataFrame,
+    feat_cols: List[str],
+    *,
+    shrinkage: float = 0.1,
+    eig_floor: float = 1e-6,
+) -> Dict[str, np.ndarray]:
+    src = source_train[feat_cols].to_numpy(float)
+    tgt = target_train[feat_cols].to_numpy(float)
+
+    src_mean = np.nanmean(src, axis=0)
+    tgt_mean = np.nanmean(tgt, axis=0)
+
+    src = np.where(np.isfinite(src), src, src_mean)
+    tgt = np.where(np.isfinite(tgt), tgt, tgt_mean)
+    src_centered = src - src_mean
+    tgt_centered = tgt - tgt_mean
+
+    src_cov = np.cov(src_centered, rowvar=False)
+    tgt_cov = np.cov(tgt_centered, rowvar=False)
+    src_cov = np.atleast_2d(np.asarray(src_cov, dtype=float))
+    tgt_cov = np.atleast_2d(np.asarray(tgt_cov, dtype=float))
+
+    src_cov_reg = _regularize_covariance(src_cov, shrinkage=shrinkage)
+    tgt_cov_reg = _regularize_covariance(tgt_cov, shrinkage=shrinkage)
+
+    source_inv_sqrt = _matrix_square_root_symmetric(src_cov_reg, inverse=True, eig_floor=eig_floor)
+    target_sqrt = _matrix_square_root_symmetric(tgt_cov_reg, inverse=False, eig_floor=eig_floor)
+    transform = source_inv_sqrt @ target_sqrt
+
+    return {
+        "source_mean": src_mean,
+        "target_mean": tgt_mean,
+        "transform": transform,
+    }
+
+
+def apply_feature_alignment_coral(
+    df: pd.DataFrame,
+    feat_cols: List[str],
+    alignment: Dict[str, np.ndarray],
+) -> pd.DataFrame:
+    out = df.copy()
+    vals = out[feat_cols].to_numpy(float)
+    vals = np.where(np.isfinite(vals), vals, alignment["source_mean"])
+    vals = (vals - alignment["source_mean"]) @ alignment["transform"] + alignment["target_mean"]
+    out.loc[:, feat_cols] = vals
+    return out
+
+
+def fit_feature_alignment(
+    source_train: pd.DataFrame,
+    target_train: pd.DataFrame,
+    feat_cols: List[str],
+    method: str,
+    coral_shrinkage: float = 0.1,
+    coral_eig_floor: float = 1e-6,
+    quantile_n_quantiles: int = 201,
+) -> Dict[str, np.ndarray]:
+    if method == "meanstd":
+        return fit_feature_alignment_meanstd(source_train, target_train, feat_cols)
+    if method == "robust_iqr":
+        return fit_feature_alignment_robust_iqr(source_train, target_train, feat_cols)
+    if method == "quantile":
+        return fit_feature_alignment_quantile(
+            source_train,
+            target_train,
+            feat_cols,
+            n_quantiles=quantile_n_quantiles,
+        )
+    if method == "coral":
+        return fit_feature_alignment_coral(
+            source_train,
+            target_train,
+            feat_cols,
+            shrinkage=coral_shrinkage,
+            eig_floor=coral_eig_floor,
+        )
+    raise ValueError(f"Unknown feature alignment method: {method}")
+
+
+def apply_feature_alignment(
+    df: pd.DataFrame,
+    feat_cols: List[str],
+    alignment: Dict[str, np.ndarray],
+    method: str,
+) -> pd.DataFrame:
+    if method == "meanstd":
+        return apply_feature_alignment_meanstd(df, feat_cols, alignment)
+    if method == "robust_iqr":
+        return apply_feature_alignment_robust_iqr(df, feat_cols, alignment)
+    if method == "quantile":
+        return apply_feature_alignment_quantile(df, feat_cols, alignment)
+    if method == "coral":
+        return apply_feature_alignment_coral(df, feat_cols, alignment)
+    raise ValueError(f"Unknown feature alignment method: {method}")
+
+
+def _add_patient_table_label(row: Dict[str, object], patient_table: str) -> Dict[str, object]:
+    return {"Patient table": patient_table, **row}
+
+
+def _cohort_domain_auc(df_a: pd.DataFrame, df_b: pd.DataFrame, feat_cols: List[str], n_folds: int = 5) -> float:
+    a = df_a.copy()
+    b = df_b.copy()
+    a["domain_label"] = 0
+    b["domain_label"] = 1
+    both = pd.concat([a, b], ignore_index=True, sort=False)
+    both = ensure_columns(both, feat_cols)
+
+    X = both[feat_cols].to_numpy(float)
+    y = both["domain_label"].to_numpy(int)
+
+    cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_STATE)
+    aucs: List[float] = []
+    for tr_idx, te_idx in cv.split(X, y):
+        pipe = Pipeline(
+            [
+                ("scaler", MinMaxScaler()),
+                ("model", LogisticRegression(max_iter=50000, random_state=RANDOM_STATE)),
+            ]
+        )
+        pipe.fit(X[tr_idx], y[tr_idx])
+        prob = pipe.predict_proba(X[te_idx])[:, 1]
+        aucs.append(float(roc_auc_score(y[te_idx], prob)))
+    return float(np.mean(aucs))
+
+
+def _feature_shift_rows(
+    *,
+    patient_table: str,
+    source_name: str,
+    target_name: str,
+    source_before: pd.DataFrame,
+    source_after: pd.DataFrame,
+    target_df: pd.DataFrame,
+    feat_cols: List[str],
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for idx, feat in enumerate(feat_cols):
+        src_before = source_before[feat].to_numpy(float)
+        src_after = source_after[feat].to_numpy(float)
+        tgt = target_df[feat].to_numpy(float)
+
+        before_delta = float(abs(np.nanmean(src_before) - np.nanmean(tgt)))
+        after_delta = float(abs(np.nanmean(src_after) - np.nanmean(tgt)))
+
+        pooled_before = np.sqrt((np.nanvar(src_before) + np.nanvar(tgt)) / 2.0)
+        pooled_after = np.sqrt((np.nanvar(src_after) + np.nanvar(tgt)) / 2.0)
+        pooled_before = pooled_before if np.isfinite(pooled_before) and pooled_before > 0 else 1.0
+        pooled_after = pooled_after if np.isfinite(pooled_after) and pooled_after > 0 else 1.0
+
+        rows.append(
+            {
+                "Patient table": patient_table,
+                "source": source_name,
+                "target": target_name,
+                "feature": feat,
+                "abs_mean_delta_before": before_delta,
+                "abs_mean_delta_after": after_delta,
+                "abs_smd_before": float(abs((np.nanmean(src_before) - np.nanmean(tgt)) / pooled_before)),
+                "abs_smd_after": float(abs((np.nanmean(src_after) - np.nanmean(tgt)) / pooled_after)),
+            }
+        )
+    return rows
+
 # ----------------------------
 # Base experiments
 # ----------------------------
@@ -427,17 +767,27 @@ def run_base_experiments(
     hyperparameter_tuning: bool = True,
     tune_combined: bool = True,
     fi_dir: str = os.path.join("outputs", "feature_importance", "feature_importance_bundles"),
+    use_feature_selection: bool = True,
+    run_feature_alignment: bool = False,
+    feature_alignment_method: str = "meanstd",
+    feature_alignment_coral_shrinkage: float = 0.1,
+    feature_alignment_coral_eig_floor: float = 1e-6,
+    feature_alignment_quantile_n_quantiles: int = 201,
 ) -> None:
-
-    # Collect summary rows for a compact results CSV requested for the paper.
     summary_rows: List[Dict[str, object]] = []
+    alignment_diag_rows: List[Dict[str, object]] = []
+    alignment_shift_rows: List[Dict[str, object]] = []
+    feat_cols = get_feature_columns(df_train_int)
 
     print("\n[1] CV on INTERNAL train (BOMI2)...")
     auc_i, std_auc_i, acc_i, std_acc_i, fi_i, model_name_i, pipe_i, params_i = run_classification_cv(
-        df_train_int, n_folds=5, hyperparameter_tuning=hyperparameter_tuning, return_model=True
+        df_train_int,
+        n_folds=5,
+        hyperparameter_tuning=hyperparameter_tuning,
+        return_model=True,
+        use_feature_selection=use_feature_selection,
     )
     print(f"[BOMI2 CV] {model_name_i} AUC: {auc_i:.3f} ± {std_auc_i:.3f}, Acc: {acc_i:.3f} ± {std_acc_i:.3f}")
-
     _save_cv_feature_bundle(
         fi_dir,
         cohort="BOMI2",
@@ -478,31 +828,34 @@ def run_base_experiments(
         notes="Permutation importance computed on BOMI1 test set using model trained on BOMI2 train.",
     )
     print(f"[BOMI2→BOMI1 test] AUC: {eval_i2e['auc']:.3f}, Acc: {eval_i2e['accuracy']:.3f}")
-
-    # If BOMI1 is not in train, report BOMI1 "train" metrics by evaluating the BOMI2-trained model on the full BOMI1 train set.
     eval_i_on_ext_train = evaluate_fast(df_train_int, df_train_ext, clone(pipe_i))
-
     summary_rows.append(
-        _make_summary_row(
-            bomi2_in_train=True,
-            bomi1_in_train=False,
-            bomi2_train_acc=acc_i,
-            bomi2_train_auc=auc_i,
-            bomi1_train_acc=eval_i_on_ext_train["accuracy"],
-            bomi1_train_auc=eval_i_on_ext_train["auc"],
-            bomi2_test_acc=eval_i2i["accuracy"],
-            bomi2_test_auc=eval_i2i["auc"],
-            bomi1_test_acc=eval_i2e["accuracy"],
-            bomi1_test_auc=eval_i2e["auc"],
+        _add_patient_table_label(
+            _make_summary_row(
+                bomi2_in_train=True,
+                bomi1_in_train=False,
+                bomi2_train_acc=acc_i,
+                bomi2_train_auc=auc_i,
+                bomi1_train_acc=eval_i_on_ext_train["accuracy"],
+                bomi1_train_auc=eval_i_on_ext_train["auc"],
+                bomi2_test_acc=eval_i2i["accuracy"],
+                bomi2_test_auc=eval_i2i["auc"],
+                bomi1_test_acc=eval_i2e["accuracy"],
+                bomi1_test_auc=eval_i2e["auc"],
+            ),
+            patient_table="original",
         )
     )
 
     print("\n[4] CV on EXTERNAL train (BOMI1)...")
     auc_e, std_auc_e, acc_e, std_acc_e, fi_e, model_name_e, pipe_e, params_e = run_classification_cv(
-        df_train_ext, n_folds=5, hyperparameter_tuning=hyperparameter_tuning, return_model=True
+        df_train_ext,
+        n_folds=5,
+        hyperparameter_tuning=hyperparameter_tuning,
+        return_model=True,
+        use_feature_selection=use_feature_selection,
     )
     print(f"[BOMI1 CV] {model_name_e} AUC: {auc_e:.3f} ± {std_auc_e:.3f}, Acc: {acc_e:.3f} ± {std_acc_e:.3f}")
-
     _save_cv_feature_bundle(
         fi_dir,
         cohort="BOMI1",
@@ -543,37 +896,38 @@ def run_base_experiments(
         notes="Permutation importance computed on BOMI2 test set using model trained on BOMI1 train.",
     )
     print(f"[BOMI1→BOMI2 test] AUC: {eval_e2i['auc']:.3f}, Acc: {eval_e2i['accuracy']:.3f}")
-
-    # If BOMI2 is not in train, report BOMI2 "train" metrics by evaluating the BOMI1-trained model on the full BOMI2 train set.
     eval_e_on_int_train = evaluate_fast(df_train_ext, df_train_int, clone(pipe_e))
-
     summary_rows.append(
-        _make_summary_row(
-            bomi2_in_train=False,
-            bomi1_in_train=True,
-            bomi2_train_acc=eval_e_on_int_train["accuracy"],
-            bomi2_train_auc=eval_e_on_int_train["auc"],
-            bomi1_train_acc=acc_e,
-            bomi1_train_auc=auc_e,
-            bomi2_test_acc=eval_e2i["accuracy"],
-            bomi2_test_auc=eval_e2i["auc"],
-            bomi1_test_acc=eval_e2e["accuracy"],
-            bomi1_test_auc=eval_e2e["auc"],
+        _add_patient_table_label(
+            _make_summary_row(
+                bomi2_in_train=False,
+                bomi1_in_train=True,
+                bomi2_train_acc=eval_e_on_int_train["accuracy"],
+                bomi2_train_auc=eval_e_on_int_train["auc"],
+                bomi1_train_acc=acc_e,
+                bomi1_train_auc=auc_e,
+                bomi2_test_acc=eval_e2i["accuracy"],
+                bomi2_test_auc=eval_e2i["auc"],
+                bomi1_test_acc=eval_e2e["accuracy"],
+                bomi1_test_auc=eval_e2e["auc"],
+            ),
+            patient_table="original",
         )
     )
 
-    # Combined train
     print("\n[7] COMBINED train (BOMI2+BOMI1): tune/select model on combined pool...")
     df_train_ext_pref = _prefix_ids(df_train_ext, prefix="BOMI1_")
     combined_train = pd.concat([df_train_int, df_train_ext_pref], ignore_index=True, sort=False)
-
     if tune_combined:
         print("[INFO] Tuning model on COMBINED train...")
         _, _, _, _, fi_c, model_name_c, pipe_c, params_c = run_classification_cv(
-            combined_train, n_folds=5, hyperparameter_tuning=hyperparameter_tuning, return_model=True
+            combined_train,
+            n_folds=5,
+            hyperparameter_tuning=hyperparameter_tuning,
+            return_model=True,
+            use_feature_selection=use_feature_selection,
         )
         print(f"[INFO] Selected COMBINED model: {model_name_c}")
-
         if fi_c is not None:
             _save_cv_feature_bundle(
                 fi_dir,
@@ -590,7 +944,6 @@ def run_base_experiments(
         model_name_c = model_name_i
         params_c = params_i
 
-    # Cohort-pure CV metrics for the combined pool (two CV scores: one per cohort)
     auc_ci, std_auc_ci, acc_ci, std_acc_ci = run_combined_cv_target_cohort(
         df_train_int=df_train_int,
         df_train_ext_pref=df_train_ext_pref,
@@ -599,7 +952,6 @@ def run_base_experiments(
         n_folds=5,
     )
     print(f"[COMBINED CV | test BOMI2-only] AUC: {auc_ci:.3f} ± {std_auc_ci:.3f}, Acc: {acc_ci:.3f} ± {std_acc_ci:.3f}")
-
     auc_ce, std_auc_ce, acc_ce, std_acc_ce = run_combined_cv_target_cohort(
         df_train_int=df_train_int,
         df_train_ext_pref=df_train_ext_pref,
@@ -638,40 +990,311 @@ def run_base_experiments(
         notes="Permutation importance computed on BOMI1 test set using model trained on COMBINED train.",
     )
     print(f"[COMBINED→BOMI1 test] AUC: {eval_c2e['auc']:.3f}, Acc: {eval_c2e['accuracy']:.3f}")
-
     summary_rows.append(
-        _make_summary_row(
-            bomi2_in_train=True,
-            bomi1_in_train=True,
-            bomi2_train_acc=acc_ci,
-            bomi2_train_auc=auc_ci,
-            bomi1_train_acc=acc_ce,
-            bomi1_train_auc=auc_ce,
-            bomi2_test_acc=eval_c2i["accuracy"],
-            bomi2_test_auc=eval_c2i["auc"],
-            bomi1_test_acc=eval_c2e["accuracy"],
-            bomi1_test_auc=eval_c2e["auc"],
+        _add_patient_table_label(
+            _make_summary_row(
+                bomi2_in_train=True,
+                bomi1_in_train=True,
+                bomi2_train_acc=acc_ci,
+                bomi2_train_auc=auc_ci,
+                bomi1_train_acc=acc_ce,
+                bomi1_train_auc=auc_ce,
+                bomi2_test_acc=eval_c2i["accuracy"],
+                bomi2_test_auc=eval_c2i["auc"],
+                bomi1_test_acc=eval_c2e["accuracy"],
+                bomi1_test_auc=eval_c2e["auc"],
+            ),
+            patient_table="original",
         )
     )
 
-    # Write the requested compact summary CSV
-    summary_df = pd.DataFrame(summary_rows, columns=[
-        "BOMI2 Train",
-        "BOMI1 Train",
-        "BOMI2 Train\nAccuracy",
-        "BOMI2 Train\nAUC",
-        "BOMI1 Train\nAccuracy",
-        "BOMI1 Train\nAUC",
-        "BOMI2 Test\nAccuracy",
-        "BOMI2 Test\nAUC",
-        "BOMI1 Test\nAccuracy",
-        "BOMI1 Test\nAUC",
-    ])
+    if run_feature_alignment:
+        print(f"\n[ALIGN] Running train-only patient-level feature alignment experiments with method={feature_alignment_method}...")
 
+        label_int_to_ext = f"aligned_BOMI2_to_BOMI1_{feature_alignment_method}"
+        label_ext_to_int = f"aligned_BOMI1_to_BOMI2_{feature_alignment_method}"
+
+        align_int_to_ext = fit_feature_alignment(
+            df_train_int,
+            df_train_ext,
+            feat_cols,
+            method=feature_alignment_method,
+            coral_shrinkage=feature_alignment_coral_shrinkage,
+            coral_eig_floor=feature_alignment_coral_eig_floor,
+            quantile_n_quantiles=feature_alignment_quantile_n_quantiles,
+        )
+        df_train_int_aligned = apply_feature_alignment(df_train_int, feat_cols, align_int_to_ext, method=feature_alignment_method)
+        df_test_int_aligned = apply_feature_alignment(df_test_int, feat_cols, align_int_to_ext, method=feature_alignment_method)
+        alignment_diag_rows.append(
+            {
+                "Patient table": label_int_to_ext,
+                "source": "BOMI2",
+                "target": "BOMI1",
+                "method": feature_alignment_method,
+                "domain_auc_train_before": _cohort_domain_auc(df_train_int, df_train_ext, feat_cols),
+                "domain_auc_train_after": _cohort_domain_auc(df_train_int_aligned, df_train_ext, feat_cols),
+            }
+        )
+        alignment_shift_rows.extend(
+            _feature_shift_rows(
+                patient_table=label_int_to_ext,
+                source_name="BOMI2",
+                target_name="BOMI1",
+                source_before=df_train_int,
+                source_after=df_train_int_aligned,
+                target_df=df_train_ext,
+                feat_cols=feat_cols,
+            )
+        )
+        auc_i_align, _, acc_i_align, _, _, _, pipe_i_align, _ = run_classification_cv(
+            df_train_int_aligned,
+            n_folds=5,
+            hyperparameter_tuning=hyperparameter_tuning,
+            return_model=True,
+            use_feature_selection=use_feature_selection,
+        )
+        eval_i_align_on_ext_train = evaluate_fast(df_train_int_aligned, df_train_ext, clone(pipe_i_align))
+        eval_i_align_on_int_test = evaluate_on_test_set(df_train_int_aligned, df_test_int_aligned, clone(pipe_i_align))
+        eval_i_align_on_ext_test = evaluate_on_test_set(df_train_int_aligned, df_test_ext, clone(pipe_i_align))
+        summary_rows.append(
+            _add_patient_table_label(
+                _make_summary_row(
+                    bomi2_in_train=True,
+                    bomi1_in_train=False,
+                    bomi2_train_acc=acc_i_align,
+                    bomi2_train_auc=auc_i_align,
+                    bomi1_train_acc=eval_i_align_on_ext_train["accuracy"],
+                    bomi1_train_auc=eval_i_align_on_ext_train["auc"],
+                    bomi2_test_acc=eval_i_align_on_int_test["accuracy"],
+                    bomi2_test_auc=eval_i_align_on_int_test["auc"],
+                    bomi1_test_acc=eval_i_align_on_ext_test["accuracy"],
+                    bomi1_test_auc=eval_i_align_on_ext_test["auc"],
+                ),
+                patient_table=label_int_to_ext,
+            )
+        )
+
+        eval_e_on_int_train_aligned = evaluate_fast(df_train_ext, df_train_int_aligned, clone(pipe_e))
+        eval_e_on_int_test_aligned = evaluate_on_test_set(df_train_ext, df_test_int_aligned, clone(pipe_e))
+        summary_rows.append(
+            _add_patient_table_label(
+                _make_summary_row(
+                    bomi2_in_train=False,
+                    bomi1_in_train=True,
+                    bomi2_train_acc=eval_e_on_int_train_aligned["accuracy"],
+                    bomi2_train_auc=eval_e_on_int_train_aligned["auc"],
+                    bomi1_train_acc=acc_e,
+                    bomi1_train_auc=auc_e,
+                    bomi2_test_acc=eval_e_on_int_test_aligned["accuracy"],
+                    bomi2_test_auc=eval_e_on_int_test_aligned["auc"],
+                    bomi1_test_acc=eval_e2e["accuracy"],
+                    bomi1_test_auc=eval_e2e["auc"],
+                ),
+                patient_table=label_int_to_ext,
+            )
+        )
+
+        combined_train_i_align = pd.concat([df_train_int_aligned, df_train_ext_pref], ignore_index=True, sort=False)
+        if tune_combined:
+            _, _, _, _, _, _, pipe_ci_align, _ = run_classification_cv(
+                combined_train_i_align,
+                n_folds=5,
+                hyperparameter_tuning=hyperparameter_tuning,
+                return_model=True,
+                use_feature_selection=use_feature_selection,
+            )
+        else:
+            pipe_ci_align = pipe_i_align
+        auc_ci_align, _, acc_ci_align, _ = run_combined_cv_target_cohort(
+            df_train_int=df_train_int_aligned,
+            df_train_ext_pref=df_train_ext_pref,
+            pipeline=pipe_ci_align,
+            target="INTERNAL",
+            n_folds=5,
+        )
+        auc_ce_align, _, acc_ce_align, _ = run_combined_cv_target_cohort(
+            df_train_int=df_train_int_aligned,
+            df_train_ext_pref=df_train_ext_pref,
+            pipeline=pipe_ci_align,
+            target="EXTERNAL",
+            n_folds=5,
+        )
+        eval_ci_align_on_int_test = evaluate_on_test_set(combined_train_i_align, df_test_int_aligned, clone(pipe_ci_align))
+        eval_ci_align_on_ext_test = evaluate_on_test_set(combined_train_i_align, df_test_ext, clone(pipe_ci_align))
+        summary_rows.append(
+            _add_patient_table_label(
+                _make_summary_row(
+                    bomi2_in_train=True,
+                    bomi1_in_train=True,
+                    bomi2_train_acc=acc_ci_align,
+                    bomi2_train_auc=auc_ci_align,
+                    bomi1_train_acc=acc_ce_align,
+                    bomi1_train_auc=auc_ce_align,
+                    bomi2_test_acc=eval_ci_align_on_int_test["accuracy"],
+                    bomi2_test_auc=eval_ci_align_on_int_test["auc"],
+                    bomi1_test_acc=eval_ci_align_on_ext_test["accuracy"],
+                    bomi1_test_auc=eval_ci_align_on_ext_test["auc"],
+                ),
+                patient_table=label_int_to_ext,
+            )
+        )
+
+        align_ext_to_int = fit_feature_alignment(
+            df_train_ext,
+            df_train_int,
+            feat_cols,
+            method=feature_alignment_method,
+            coral_shrinkage=feature_alignment_coral_shrinkage,
+            coral_eig_floor=feature_alignment_coral_eig_floor,
+            quantile_n_quantiles=feature_alignment_quantile_n_quantiles,
+        )
+        df_train_ext_aligned = apply_feature_alignment(df_train_ext, feat_cols, align_ext_to_int, method=feature_alignment_method)
+        df_test_ext_aligned = apply_feature_alignment(df_test_ext, feat_cols, align_ext_to_int, method=feature_alignment_method)
+        alignment_diag_rows.append(
+            {
+                "Patient table": label_ext_to_int,
+                "source": "BOMI1",
+                "target": "BOMI2",
+                "method": feature_alignment_method,
+                "domain_auc_train_before": _cohort_domain_auc(df_train_ext, df_train_int, feat_cols),
+                "domain_auc_train_after": _cohort_domain_auc(df_train_ext_aligned, df_train_int, feat_cols),
+            }
+        )
+        alignment_shift_rows.extend(
+            _feature_shift_rows(
+                patient_table=label_ext_to_int,
+                source_name="BOMI1",
+                target_name="BOMI2",
+                source_before=df_train_ext,
+                source_after=df_train_ext_aligned,
+                target_df=df_train_int,
+                feat_cols=feat_cols,
+            )
+        )
+        eval_i_on_ext_train_aligned = evaluate_fast(df_train_int, df_train_ext_aligned, clone(pipe_i))
+        eval_i_on_ext_test_aligned = evaluate_on_test_set(df_train_int, df_test_ext_aligned, clone(pipe_i))
+        summary_rows.append(
+            _add_patient_table_label(
+                _make_summary_row(
+                    bomi2_in_train=True,
+                    bomi1_in_train=False,
+                    bomi2_train_acc=acc_i,
+                    bomi2_train_auc=auc_i,
+                    bomi1_train_acc=eval_i_on_ext_train_aligned["accuracy"],
+                    bomi1_train_auc=eval_i_on_ext_train_aligned["auc"],
+                    bomi2_test_acc=eval_i2i["accuracy"],
+                    bomi2_test_auc=eval_i2i["auc"],
+                    bomi1_test_acc=eval_i_on_ext_test_aligned["accuracy"],
+                    bomi1_test_auc=eval_i_on_ext_test_aligned["auc"],
+                ),
+                patient_table=label_ext_to_int,
+            )
+        )
+
+        auc_e_align, _, acc_e_align, _, _, _, pipe_e_align, _ = run_classification_cv(
+            df_train_ext_aligned,
+            n_folds=5,
+            hyperparameter_tuning=hyperparameter_tuning,
+            return_model=True,
+            use_feature_selection=use_feature_selection,
+        )
+        eval_e_align_on_int_train = evaluate_fast(df_train_ext_aligned, df_train_int, clone(pipe_e_align))
+        eval_e_align_on_int_test = evaluate_on_test_set(df_train_ext_aligned, df_test_int, clone(pipe_e_align))
+        eval_e_align_on_ext_test = evaluate_on_test_set(df_train_ext_aligned, df_test_ext_aligned, clone(pipe_e_align))
+        summary_rows.append(
+            _add_patient_table_label(
+                _make_summary_row(
+                    bomi2_in_train=False,
+                    bomi1_in_train=True,
+                    bomi2_train_acc=eval_e_align_on_int_train["accuracy"],
+                    bomi2_train_auc=eval_e_align_on_int_train["auc"],
+                    bomi1_train_acc=acc_e_align,
+                    bomi1_train_auc=auc_e_align,
+                    bomi2_test_acc=eval_e_align_on_int_test["accuracy"],
+                    bomi2_test_auc=eval_e_align_on_int_test["auc"],
+                    bomi1_test_acc=eval_e_align_on_ext_test["accuracy"],
+                    bomi1_test_auc=eval_e_align_on_ext_test["auc"],
+                ),
+                patient_table=label_ext_to_int,
+            )
+        )
+
+        df_train_ext_aligned_pref = _prefix_ids(df_train_ext_aligned, prefix="BOMI1_")
+        combined_train_e_align = pd.concat([df_train_int, df_train_ext_aligned_pref], ignore_index=True, sort=False)
+        if tune_combined:
+            _, _, _, _, _, _, pipe_ce_align, _ = run_classification_cv(
+                combined_train_e_align,
+                n_folds=5,
+                hyperparameter_tuning=hyperparameter_tuning,
+                return_model=True,
+                use_feature_selection=use_feature_selection,
+            )
+        else:
+            pipe_ce_align = pipe_e_align
+        auc_ci_align2, _, acc_ci_align2, _ = run_combined_cv_target_cohort(
+            df_train_int=df_train_int,
+            df_train_ext_pref=df_train_ext_aligned_pref,
+            pipeline=pipe_ce_align,
+            target="INTERNAL",
+            n_folds=5,
+        )
+        auc_ce_align2, _, acc_ce_align2, _ = run_combined_cv_target_cohort(
+            df_train_int=df_train_int,
+            df_train_ext_pref=df_train_ext_aligned_pref,
+            pipeline=pipe_ce_align,
+            target="EXTERNAL",
+            n_folds=5,
+        )
+        eval_ce_align_on_int_test = evaluate_on_test_set(combined_train_e_align, df_test_int, clone(pipe_ce_align))
+        eval_ce_align_on_ext_test = evaluate_on_test_set(combined_train_e_align, df_test_ext_aligned, clone(pipe_ce_align))
+        summary_rows.append(
+            _add_patient_table_label(
+                _make_summary_row(
+                    bomi2_in_train=True,
+                    bomi1_in_train=True,
+                    bomi2_train_acc=acc_ci_align2,
+                    bomi2_train_auc=auc_ci_align2,
+                    bomi1_train_acc=acc_ce_align2,
+                    bomi1_train_auc=auc_ce_align2,
+                    bomi2_test_acc=eval_ce_align_on_int_test["accuracy"],
+                    bomi2_test_auc=eval_ce_align_on_int_test["auc"],
+                    bomi1_test_acc=eval_ce_align_on_ext_test["accuracy"],
+                    bomi1_test_auc=eval_ce_align_on_ext_test["auc"],
+                ),
+                patient_table=label_ext_to_int,
+            )
+        )
+
+    summary_df = pd.DataFrame(
+        summary_rows,
+        columns=[
+            "Patient table",
+            "BOMI2 Train",
+            "BOMI1 Train",
+            "BOMI2 Train\nAccuracy",
+            "BOMI2 Train\nAUC",
+            "BOMI1 Train\nAccuracy",
+            "BOMI1 Train\nAUC",
+            "BOMI2 Test\nAccuracy",
+            "BOMI2 Test\nAUC",
+            "BOMI1 Test\nAccuracy",
+            "BOMI1 Test\nAUC",
+        ],
+    )
     out_csv = os.path.join("outputs", "metrics", "cohort_mixing_summary.csv")
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     summary_df.to_csv(out_csv, index=False)
     print(f"\n[SUMMARY] Saved cohort mixing summary to {out_csv}")
+
+    if run_feature_alignment and alignment_diag_rows:
+        diag_path = os.path.join("outputs", "metrics", "feature_alignment_diagnostics.csv")
+        pd.DataFrame(alignment_diag_rows).to_csv(diag_path, index=False)
+        print(f"[ALIGN] Saved diagnostics to {diag_path}")
+
+    if run_feature_alignment and alignment_shift_rows:
+        shift_path = os.path.join("outputs", "metrics", "feature_alignment_shift_summary.csv")
+        pd.DataFrame(alignment_shift_rows).to_csv(shift_path, index=False)
+        print(f"[ALIGN] Saved feature-shift summary to {shift_path}")
 
     print("\n[INFO] Base experiments completed.")
 
@@ -695,6 +1318,12 @@ def build_argparser() -> argparse.ArgumentParser:
 
     # Modeling
     p.add_argument("--no-hyperparameter-tuning", action="store_true")
+    p.add_argument("--no-feature-selection", action="store_true")
+    p.add_argument("--run-feature-alignment", action="store_true")
+    p.add_argument("--feature-alignment-method", type=str, default="meanstd", choices=["meanstd", "robust_iqr", "quantile", "coral"])
+    p.add_argument("--feature-alignment-coral-shrinkage", type=float, default=0.1)
+    p.add_argument("--feature-alignment-coral-eig-floor", type=float, default=1e-6)
+    p.add_argument("--feature-alignment-quantile-n-quantiles", type=int, default=201)
     p.add_argument("--no-tune-combined", action="store_true")
     p.add_argument(
         "--fi-dir",
@@ -723,6 +1352,7 @@ def main() -> None:
 
     qc = CountQC(min_total=args.qc_min_total, min_cancer=args.qc_min_cancer, min_stroma=args.qc_min_stroma)
     hyperparameter_tuning = (not args.no_hyperparameter_tuning)
+    use_feature_selection = (not args.no_feature_selection)
     tune_combined = (not args.no_tune_combined)
 
     df_train_int, df_test_int, df_train_ext, df_test_ext = prepare_patient_level_tables(
@@ -744,6 +1374,12 @@ def main() -> None:
         hyperparameter_tuning=hyperparameter_tuning,
         tune_combined=tune_combined,
         fi_dir=args.fi_dir,
+        use_feature_selection=use_feature_selection,
+        run_feature_alignment=args.run_feature_alignment,
+        feature_alignment_method=args.feature_alignment_method,
+        feature_alignment_coral_shrinkage=args.feature_alignment_coral_shrinkage,
+        feature_alignment_coral_eig_floor=args.feature_alignment_coral_eig_floor,
+        feature_alignment_quantile_n_quantiles=args.feature_alignment_quantile_n_quantiles,
     )
 
     if args.run_learning_curve:
@@ -774,7 +1410,11 @@ def main() -> None:
             hyperparameter_tuning=hyperparameter_tuning,
             out_dir=args.learning_out_dir,
             eval_mode=args.learning_eval,
-            run_classification_cv_fn=run_classification_cv,
+            run_classification_cv_fn=lambda *a, **kw: run_classification_cv(
+                *a,
+                **kw,
+                use_feature_selection=use_feature_selection,
+            ),
             prefix_ids_fn=_prefix_ids,
             n_jobs=args.n_jobs,
         )

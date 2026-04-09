@@ -7,6 +7,8 @@ from typing import List, Tuple
 import numpy as np
 import pandas as pd
 
+CK_POSITIVE_EXTERNAL_CLASSES = {"neoplastic", "epithelial"}
+
 
 @dataclass(frozen=True)
 class CountQC:
@@ -161,7 +163,7 @@ def preprocess_external_cells(bomi1_cells: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"External cells file missing columns: {missing}. Columns: {list(df.columns)}")
 
     df = df.rename(columns={"CentroidX_um": "x", "CentroidY_um": "y"})
-    df["Cancer"] = (df["Class"].astype(str).str.strip().str.lower() == "neoplastic").astype(int)
+    df["Cancer"] = df["Class"].astype(str).str.strip().str.lower().isin(CK_POSITIVE_EXTERNAL_CLASSES).astype(int)
 
     df["x"] = pd.to_numeric(df["x"], errors="coerce")
     df["y"] = pd.to_numeric(df["y"], errors="coerce")
