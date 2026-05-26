@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -15,6 +16,14 @@ def spatial_data_pipeline_module(load_script_module):
     return load_script_module(
         "spatial_data_pipeline.py",
         "spatial_data_pipeline_under_test",
+    )
+
+
+@pytest.fixture
+def spatial_statistics5_module(load_script_module):
+    return load_script_module(
+        "spatial_statistics5.py",
+        "spatial_statistics5_under_test",
     )
 
 
@@ -95,14 +104,14 @@ def test_preprocess_cell_tables_and_external_meta(spatial_utils_module):
 
     external = pd.DataFrame(
         {
-            "CentroidX_um": [100.0, 110.0],
-            "CentroidY_um": [200.0, 210.0],
-            "Class": ["neoplastic", "stroma"],
-            "sample_name": ["ULunA1_A-1", "ULunA1_A-1"],
+            "CentroidX_um": [100.0, 110.0, 120.0],
+            "CentroidY_um": [200.0, 210.0, 220.0],
+            "Class": ["neoplastic", "epithelial", "stroma"],
+            "sample_name": ["ULunA1_A-1", "ULunA1_A-1", "ULunA1_A-1"],
         }
     )
     external_processed = spatial_utils_module.preprocess_external_cells(external)
-    assert external_processed["Cancer"].tolist() == [1, 0]
+    assert external_processed["Cancer"].tolist() == [1, 1, 0]
 
     meta = pd.DataFrame(
         {
@@ -189,3 +198,225 @@ def test_spatial_data_pipeline_sorts_metrics_and_patients_deterministically(spat
 
     sorted_patients = spatial_data_pipeline_module._sort_patient_rows(patient_df)
     assert sorted_patients["ID"].tolist() == ["p1", "p2"]
+
+
+def test_feature_alignment_coral_handles_colinear_features(spatial_statistics5_module):
+    rng = np.random.default_rng(7)
+    latent = rng.normal(size=(120, 2))
+    source = np.column_stack(
+        [
+            latent[:, 0],
+            2.0 * latent[:, 0] + 0.01 * rng.normal(size=120),
+            latent[:, 1],
+            latent[:, 0] + latent[:, 1] + 0.01 * rng.normal(size=120),
+        ]
+    )
+
+    mixing = np.array(
+        [
+            [1.2, 0.3, 0.0, 0.4],
+            [0.1, 0.8, 0.5, 0.2],
+            [0.3, 0.0, 1.1, 0.2],
+            [0.2, 0.1, 0.4, 1.0],
+        ]
+    )
+    shift = np.array([1.5, -0.8, 0.7, 2.0])
+    target = source @ mixing + shift + 0.02 * rng.normal(size=source.shape)
+
+    feat_cols = ["f1", "f2", "f3", "f4"]
+    source_df = pd.DataFrame(source, columns=feat_cols)
+    target_df = pd.DataFrame(target, columns=feat_cols)
+
+    alignment = spatial_statistics5_module.fit_feature_alignment(
+        source_df,
+        target_df,
+        feat_cols,
+        method="coral",
+        coral_shrinkage=0.2,
+        coral_eig_floor=1e-5,
+    )
+    aligned = spatial_statistics5_module.apply_feature_alignment(
+        source_df,
+        feat_cols,
+        alignment,
+        method="coral",
+    )
+
+    source_cov = np.cov(source_df[feat_cols].to_numpy(float), rowvar=False)
+    target_cov = np.cov(target_df[feat_cols].to_numpy(float), rowvar=False)
+    aligned_cov = np.cov(aligned[feat_cols].to_numpy(float), rowvar=False)
+
+    before_mean_gap = np.linalg.norm(source_df[feat_cols].mean().to_numpy() - target_df[feat_cols].mean().to_numpy())
+    after_mean_gap = np.linalg.norm(aligned[feat_cols].mean().to_numpy() - target_df[feat_cols].mean().to_numpy())
+    before_cov_gap = np.linalg.norm(source_cov - target_cov, ord="fro")
+    after_cov_gap = np.linalg.norm(aligned_cov - target_cov, ord="fro")
+
+    assert np.isfinite(aligned[feat_cols].to_numpy()).all()
+    assert after_mean_gap < before_mean_gap * 0.05
+    assert after_cov_gap < before_cov_gap * 0.6
+
+
+def test_feature_alignment_quantile_matches_marginals(spatial_statistics5_module):
+    rng = np.random.default_rng(11)
+    feat_cols = ["f1", "f2"]
+    source = pd.DataFrame(
+        {
+            "f1": rng.normal(loc=0.0, scale=1.0, size=400),
+            "f2": rng.exponential(scale=1.0, size=400),
+        }
+    )
+    target = pd.DataFrame(
+        {
+            "f1": rng.normal(loc=2.5, scale=0.6, size=400),
+            "f2": rng.gamma(shape=2.0, scale=1.5, size=400),
+        }
+    )
+
+    alignment = spatial_statistics5_module.fit_feature_alignment(
+        source,
+        target,
+        feat_cols,
+        method="quantile",
+        quantile_n_quantiles=101,
+    )
+    aligned = spatial_statistics5_module.apply_feature_alignment(
+        source,
+        feat_cols,
+        alignment,
+        method="quantile",
+    )
+
+    quantiles = np.array([0.1, 0.25, 0.5, 0.75, 0.9])
+    before_gap = 0.0
+    after_gap = 0.0
+    for feat in feat_cols:
+        src_q = np.quantile(source[feat].to_numpy(float), quantiles)
+        aligned_q = np.quantile(aligned[feat].to_numpy(float), quantiles)
+        tgt_q = np.quantile(target[feat].to_numpy(float), quantiles)
+        before_gap += float(np.mean(np.abs(src_q - tgt_q)))
+        after_gap += float(np.mean(np.abs(aligned_q - tgt_q)))
+
+    assert np.isfinite(aligned[feat_cols].to_numpy()).all()
+    assert after_gap < before_gap * 0.2
+
+
+def test_repeat_test_seed_helpers_return_summary(spatial_statistics5_module):
+    mod = spatial_statistics5_module
+
+    train_df = pd.DataFrame(
+        {
+            "ID": ["p1", "p2", "p3", "p4", "p5", "p6"],
+            "label": [0, 0, 0, 1, 1, 1],
+            "cell_count": [10, 10, 10, 10, 10, 10],
+            "cancer_count": [5, 5, 5, 5, 5, 5],
+            "stroma_count": [5, 5, 5, 5, 5, 5],
+            "feat_a": [0.0, 0.2, 0.3, 1.0, 1.1, 1.2],
+            "feat_b": [0.1, 0.0, 0.2, 0.9, 1.0, 1.1],
+        }
+    )
+    test_df = pd.DataFrame(
+        {
+            "ID": ["t1", "t2", "t3", "t4"],
+            "label": [0, 0, 1, 1],
+            "cell_count": [10, 10, 10, 10],
+            "cancer_count": [5, 5, 5, 5],
+            "stroma_count": [5, 5, 5, 5],
+            "feat_a": [0.15, 0.25, 1.05, 1.15],
+            "feat_b": [0.05, 0.18, 0.95, 1.05],
+        }
+    )
+
+    pipeline = mod._build_pipeline(mod.LogisticRegression(max_iter=5000, random_state=mod.RANDOM_STATE))
+    seeded = mod._clone_with_seed(pipeline, seed=123)
+    assert seeded.get_params()["oversample__random_state"] == 123
+    assert seeded.get_params()["model__random_state"] == 123
+
+    repeated = mod.evaluate_on_test_set_repeated(
+        train_df,
+        test_df,
+        pipeline,
+        repeat_test_seeds=3,
+        base_seed=100,
+    )
+
+    assert repeated["n_repeats"] == 3
+    assert repeated["seeds"] == [100, 101, 102]
+    assert list(repeated["repeat_metrics"].columns) == ["seed", "auc", "accuracy"]
+    assert len(repeated["repeat_metrics"]) == 3
+    assert {"feature", "importance", "importance_sem"}.issubset(repeated["feature_importance"].columns)
+
+
+def test_build_final_report_table_matches_within_deltas(spatial_statistics5_module):
+    mod = spatial_statistics5_module
+
+    summary_df = pd.DataFrame(
+        [
+            {
+                "Patient table": "original",
+                "BOMI2 Train": "x",
+                "BOMI1 Train": "",
+                "BOMI2 Test\nAUC": 0.978,
+                "BOMI1 Test\nAUC": 0.618,
+            },
+            {
+                "Patient table": "original",
+                "BOMI2 Train": "",
+                "BOMI1 Train": "x",
+                "BOMI2 Test\nAUC": 0.853,
+                "BOMI1 Test\nAUC": 0.782,
+            },
+            {
+                "Patient table": "original",
+                "BOMI2 Train": "x",
+                "BOMI1 Train": "x",
+                "BOMI2 Test\nAUC": 0.880,
+                "BOMI1 Test\nAUC": 0.782,
+            },
+            {
+                "Patient table": "aligned_BOMI2_to_BOMI1_meanstd",
+                "BOMI2 Train": "x",
+                "BOMI1 Train": "",
+                "BOMI2 Test\nAUC": 0.960,
+                "BOMI1 Test\nAUC": 0.700,
+            },
+            {
+                "Patient table": "aligned_BOMI2_to_BOMI1_meanstd",
+                "BOMI2 Train": "",
+                "BOMI1 Train": "x",
+                "BOMI2 Test\nAUC": 0.840,
+                "BOMI1 Test\nAUC": 0.782,
+            },
+            {
+                "Patient table": "aligned_BOMI2_to_BOMI1_meanstd",
+                "BOMI2 Train": "x",
+                "BOMI1 Train": "x",
+                "BOMI2 Test\nAUC": 0.910,
+                "BOMI1 Test\nAUC": 0.790,
+            },
+        ]
+    )
+
+    report_df = mod.build_final_report_table(summary_df, "original")
+
+    assert report_df["Training cohort"].tolist() == [
+        "mIF",
+        "H&E",
+        "mIF",
+        "H&E",
+        "mIF + H&E",
+        "mIF + H&E",
+    ]
+    assert report_df["Test cohort"].tolist() == ["mIF", "H&E", "H&E", "mIF", "mIF", "H&E"]
+    assert report_df["Setting"].tolist() == [
+        "Within-cohort",
+        "Within-cohort",
+        "Cross-cohort",
+        "Cross-cohort",
+        "Combined",
+        "Combined",
+    ]
+    assert report_df["ROC AUC"].tolist() == pytest.approx([0.978, 0.782, 0.618, 0.853, 0.880, 0.782])
+    assert report_df["ΔAUC vs within"].tolist() == pytest.approx([0.0, 0.0, -0.164, -0.125, -0.098, 0.0])
+
+    aligned_report_df = mod.build_final_report_table(summary_df, "aligned_BOMI2_to_BOMI1_meanstd")
+    assert aligned_report_df["ΔAUC vs within"].tolist() == pytest.approx([0.0, 0.0, -0.082, -0.120, -0.050, 0.008])
