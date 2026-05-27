@@ -61,6 +61,7 @@ from spatial_artifact_utils import (
     extract_selected_features as _extract_selected_features,
     make_summary_row as _make_summary_row,
     prefix_ids as _prefix_ids,
+    sem as _sem,
     save_feature_importance_bundle,
     save_predictions as _save_predictions,
 )
@@ -97,6 +98,18 @@ def _build_pipeline(model, selector=None) -> Pipeline:
         steps.append(("selector", selector))
     steps.append(("model", model))
     return Pipeline(steps)
+
+
+def _clone_with_seed(estimator, seed: int):
+    cloned = clone(estimator)
+    updates = {
+        name: seed
+        for name in cloned.get_params(deep=True)
+        if name.endswith("random_state")
+    }
+    if updates:
+        cloned = cloned.set_params(**updates)
+    return cloned
 
 
 def _tune_best_pipeline(
@@ -370,8 +383,16 @@ def _evaluate_and_save_test_run(
     best_params: dict,
     prediction_path: str,
     notes: str,
+    repeat_test_seeds: int = 1,
+    base_seed: int = RANDOM_STATE,
 ) -> Dict:
-    eval_dict = evaluate_on_test_set(train_df, test_df, clone(pipeline))
+    eval_dict = evaluate_on_test_set_repeated(
+        train_df,
+        test_df,
+        clone(pipeline),
+        repeat_test_seeds=repeat_test_seeds,
+        base_seed=base_seed,
+    )
     save_feature_importance_bundle(
         fi_dir,
         cohort=cohort,
@@ -382,13 +403,29 @@ def _evaluate_and_save_test_run(
         n_patients_eval=len(test_df),
         feature_columns=get_feature_columns(train_df),
         fi_df=eval_dict["feature_importance"],
-        notes=notes,
+        notes=(
+            f"{notes} "
+            f"Holdout evaluation repeated across {eval_dict['n_repeats']} seed(s) "
+            f"starting at seed={eval_dict['base_seed']}; feature importance is averaged over repeats."
+        ),
     )
-    _save_predictions(prediction_path, test_df, eval_dict)
+    _save_predictions(prediction_path, test_df, eval_dict["base_eval"])
+
+    _save_repeated_holdout_outputs(
+        eval_dict=eval_dict,
+        cohort=cohort,
+        regime=regime,
+        model_name=model_name,
+    )
     return eval_dict
 
 
-def evaluate_on_test_set(train_df: pd.DataFrame, test_df: pd.DataFrame, pipeline: Pipeline) -> Dict:
+def evaluate_on_test_set(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    pipeline: Pipeline,
+    seed: int = RANDOM_STATE,
+) -> Dict:
     feat_cols = get_feature_columns(train_df)
     train_df2 = ensure_columns(train_df, feat_cols)
     test_df2 = ensure_columns(test_df, feat_cols)
@@ -398,6 +435,8 @@ def evaluate_on_test_set(train_df: pd.DataFrame, test_df: pd.DataFrame, pipeline
     X_te = test_df2[feat_cols].to_numpy(float)
     y_te = test_df2["label"].to_numpy(int)
 
+    set_global_seed(seed)
+    pipeline = _clone_with_seed(pipeline, seed)
     pipeline.fit(X_tr, y_tr)
     y_prob = pipeline.predict_proba(X_te)[:, 1]
     y_pred = pipeline.predict(X_te)
@@ -411,7 +450,7 @@ def evaluate_on_test_set(train_df: pd.DataFrame, test_df: pd.DataFrame, pipeline
         X_te,
         y_te,
         n_repeats=25,
-        random_state=RANDOM_STATE,
+        random_state=seed,
         scoring="roc_auc",
     )
     fi = pd.DataFrame({"feature": feat_cols, "importance": perm.importances_mean}).sort_values("importance", ascending=False)
@@ -424,6 +463,94 @@ def evaluate_on_test_set(train_df: pd.DataFrame, test_df: pd.DataFrame, pipeline
         "y_probs": y_prob,
         "feature_importance": fi,
     }
+
+
+def evaluate_on_test_set_repeated(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    pipeline: Pipeline,
+    repeat_test_seeds: int = 1,
+    base_seed: int = RANDOM_STATE,
+) -> Dict:
+    repeat_test_seeds = max(int(repeat_test_seeds), 1)
+    seeds = [int(base_seed) + idx for idx in range(repeat_test_seeds)]
+    evals = [evaluate_on_test_set(train_df, test_df, pipeline, seed=seed) for seed in seeds]
+
+    repeat_metrics_df = pd.DataFrame(
+        {
+            "seed": seeds,
+            "auc": [float(ed["auc"]) for ed in evals],
+            "accuracy": [float(ed["accuracy"]) for ed in evals],
+        }
+    )
+
+    fi_concat = pd.concat(
+        [
+            ed["feature_importance"][["feature", "importance"]].assign(seed=seed)
+            for seed, ed in zip(seeds, evals)
+        ],
+        ignore_index=True,
+    )
+    fi_summary = (
+        fi_concat.groupby("feature", as_index=False)["importance"]
+        .agg(["mean", lambda x: 0.0 if len(x) <= 1 else _sem(list(x))])
+        .reset_index()
+        .rename(columns={"mean": "importance", "<lambda_0>": "importance_sem"})
+        .sort_values("importance", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    base_eval = evals[0]
+    return {
+        "auc": float(repeat_metrics_df["auc"].mean()),
+        "accuracy": float(repeat_metrics_df["accuracy"].mean()),
+        "auc_sem": 0.0 if len(repeat_metrics_df) <= 1 else float(_sem(repeat_metrics_df["auc"].tolist())),
+        "accuracy_sem": 0.0 if len(repeat_metrics_df) <= 1 else float(_sem(repeat_metrics_df["accuracy"].tolist())),
+        "n_repeats": int(repeat_test_seeds),
+        "base_seed": int(base_seed),
+        "seeds": seeds,
+        "repeat_metrics": repeat_metrics_df,
+        "feature_importance": fi_summary,
+        "base_eval": base_eval,
+        "y_true": base_eval["y_true"],
+        "y_pred": base_eval["y_pred"],
+        "y_probs": base_eval["y_probs"],
+    }
+
+
+def _save_repeated_holdout_outputs(
+    *,
+    eval_dict: Dict,
+    cohort: str,
+    regime: str,
+    model_name: str,
+) -> None:
+    if int(eval_dict.get("n_repeats", 1)) <= 1:
+        return
+
+    repeat_dir = os.path.join("outputs", "metrics", "test_seed_repeats")
+    os.makedirs(repeat_dir, exist_ok=True)
+    repeat_stem = f"{cohort}__{regime}"
+    repeat_metrics_path = os.path.join(repeat_dir, f"{repeat_stem}__per_seed.csv")
+    repeat_summary_path = os.path.join(repeat_dir, f"{repeat_stem}__summary.csv")
+    eval_dict["repeat_metrics"].to_csv(repeat_metrics_path, index=False)
+    pd.DataFrame(
+        [
+            {
+                "cohort": cohort,
+                "regime": regime,
+                "model_name": model_name,
+                "n_repeats": eval_dict["n_repeats"],
+                "base_seed": eval_dict["base_seed"],
+                "auc_mean": eval_dict["auc"],
+                "auc_sem": eval_dict["auc_sem"],
+                "accuracy_mean": eval_dict["accuracy"],
+                "accuracy_sem": eval_dict["accuracy_sem"],
+            }
+        ]
+    ).to_csv(repeat_summary_path, index=False)
+    print(f"[INFO] Saved per-seed holdout metrics to {repeat_metrics_path}")
+    print(f"[INFO] Saved repeated holdout summary to {repeat_summary_path}")
 
 
 def fit_feature_alignment_meanstd(
@@ -691,6 +818,119 @@ def _add_patient_table_label(row: Dict[str, object], patient_table: str) -> Dict
     return {"Patient table": patient_table, **row}
 
 
+def _get_single_summary_row(summary_df: pd.DataFrame, patient_table: str, *, bomi2_in_train: bool, bomi1_in_train: bool) -> pd.Series:
+    mask = (
+        (summary_df["Patient table"] == patient_table)
+        & (summary_df["BOMI2 Train"].eq("x") == bool(bomi2_in_train))
+        & (summary_df["BOMI1 Train"].eq("x") == bool(bomi1_in_train))
+    )
+    matches = summary_df.loc[mask]
+    if len(matches) != 1:
+        raise ValueError(
+            f"Expected exactly one summary row for patient_table={patient_table}, "
+            f"BOMI2 Train={bomi2_in_train}, BOMI1 Train={bomi1_in_train}; found {len(matches)}."
+        )
+    return matches.iloc[0]
+
+
+def build_final_report_table(summary_df: pd.DataFrame, patient_table: str) -> pd.DataFrame:
+    row_i = _get_single_summary_row(summary_df, patient_table, bomi2_in_train=True, bomi1_in_train=False)
+    row_e = _get_single_summary_row(summary_df, patient_table, bomi2_in_train=False, bomi1_in_train=True)
+    row_c = _get_single_summary_row(summary_df, patient_table, bomi2_in_train=True, bomi1_in_train=True)
+
+    within_mif_auc = float(row_i["BOMI2 Test\nAUC"])
+    within_he_auc = float(row_e["BOMI1 Test\nAUC"])
+
+    rows = [
+        {
+            "Training cohort": "mIF",
+            "Test cohort": "mIF",
+            "Setting": "Within-cohort",
+            "ROC AUC": within_mif_auc,
+            "ΔAUC vs within": 0.0,
+        },
+        {
+            "Training cohort": "H&E",
+            "Test cohort": "H&E",
+            "Setting": "Within-cohort",
+            "ROC AUC": within_he_auc,
+            "ΔAUC vs within": 0.0,
+        },
+        {
+            "Training cohort": "mIF",
+            "Test cohort": "H&E",
+            "Setting": "Cross-cohort",
+            "ROC AUC": float(row_i["BOMI1 Test\nAUC"]),
+            "ΔAUC vs within": float(row_i["BOMI1 Test\nAUC"]) - within_he_auc,
+        },
+        {
+            "Training cohort": "H&E",
+            "Test cohort": "mIF",
+            "Setting": "Cross-cohort",
+            "ROC AUC": float(row_e["BOMI2 Test\nAUC"]),
+            "ΔAUC vs within": float(row_e["BOMI2 Test\nAUC"]) - within_mif_auc,
+        },
+        {
+            "Training cohort": "mIF + H&E",
+            "Test cohort": "mIF",
+            "Setting": "Combined",
+            "ROC AUC": float(row_c["BOMI2 Test\nAUC"]),
+            "ΔAUC vs within": float(row_c["BOMI2 Test\nAUC"]) - within_mif_auc,
+        },
+        {
+            "Training cohort": "mIF + H&E",
+            "Test cohort": "H&E",
+            "Setting": "Combined",
+            "ROC AUC": float(row_c["BOMI1 Test\nAUC"]),
+            "ΔAUC vs within": float(row_c["BOMI1 Test\nAUC"]) - within_he_auc,
+        },
+    ]
+    return pd.DataFrame(rows)
+
+
+def _format_markdown_value(value: object) -> str:
+    if isinstance(value, (float, np.floating)):
+        return f"{float(value):.3f}"
+    return str(value)
+
+
+def _dataframe_to_markdown_table(df: pd.DataFrame) -> str:
+    headers = [str(col) for col in df.columns]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(["---"] * len(headers)) + " |",
+    ]
+    for _, row in df.iterrows():
+        lines.append("| " + " | ".join(_format_markdown_value(row[col]) for col in df.columns) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def save_final_report_tables(summary_df: pd.DataFrame, out_dir: str = os.path.join("outputs", "metrics")) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+
+    report_tables_all: List[pd.DataFrame] = []
+    for patient_table in summary_df["Patient table"].astype(str).drop_duplicates().tolist():
+        report_df = build_final_report_table(summary_df, patient_table)
+        report_tables_all.append(report_df.assign(**{"Patient table": patient_table}))
+
+        stem = os.path.join(out_dir, f"final_report_table__{patient_table}")
+        report_df.to_csv(f"{stem}.csv", index=False)
+        with open(f"{stem}.md", "w", encoding="utf-8") as f:
+            f.write(_dataframe_to_markdown_table(report_df))
+        print(f"[SUMMARY] Saved final report table to {stem}.csv")
+        print(f"[SUMMARY] Saved final report table markdown to {stem}.md")
+
+    if report_tables_all:
+        combined_df = pd.concat(report_tables_all, ignore_index=True)
+        combined_csv = os.path.join(out_dir, "final_report_tables_all.csv")
+        combined_md = os.path.join(out_dir, "final_report_tables_all.md")
+        combined_df.to_csv(combined_csv, index=False)
+        with open(combined_md, "w", encoding="utf-8") as f:
+            f.write(_dataframe_to_markdown_table(combined_df))
+        print(f"[SUMMARY] Saved all final report tables to {combined_csv}")
+        print(f"[SUMMARY] Saved all final report tables markdown to {combined_md}")
+
+
 def _cohort_domain_auc(df_a: pd.DataFrame, df_b: pd.DataFrame, feat_cols: List[str], n_folds: int = 5) -> float:
     a = df_a.copy()
     b = df_b.copy()
@@ -773,11 +1013,31 @@ def run_base_experiments(
     feature_alignment_coral_shrinkage: float = 0.1,
     feature_alignment_coral_eig_floor: float = 1e-6,
     feature_alignment_quantile_n_quantiles: int = 201,
+    repeat_test_seeds: int = 1,
 ) -> None:
     summary_rows: List[Dict[str, object]] = []
+    repeated_holdout_rows: List[Dict[str, object]] = []
     alignment_diag_rows: List[Dict[str, object]] = []
     alignment_shift_rows: List[Dict[str, object]] = []
     feat_cols = get_feature_columns(df_train_int)
+
+    def _record_repeated_holdout(patient_table: str, train_label: str, test_label: str, model_name: str, eval_dict: Dict) -> None:
+        if int(eval_dict.get("n_repeats", 1)) <= 1:
+            return
+        repeated_holdout_rows.append(
+            {
+                "Patient table": patient_table,
+                "Train cohort": train_label,
+                "Test cohort": test_label,
+                "Model": model_name,
+                "n_repeats": int(eval_dict["n_repeats"]),
+                "base_seed": int(eval_dict["base_seed"]),
+                "AUC mean": float(eval_dict["auc"]),
+                "AUC SEM": float(eval_dict["auc_sem"]),
+                "Accuracy mean": float(eval_dict["accuracy"]),
+                "Accuracy SEM": float(eval_dict["accuracy_sem"]),
+            }
+        )
 
     print("\n[1] CV on INTERNAL train (BOMI2)...")
     auc_i, std_auc_i, acc_i, std_acc_i, fi_i, model_name_i, pipe_i, params_i = run_classification_cv(
@@ -811,8 +1071,15 @@ def run_base_experiments(
         best_params=params_i,
         prediction_path=os.path.join("outputs", "predictions", "pred_internal_train_to_internal_test.csv"),
         notes="Permutation importance computed on BOMI2 test set using model trained on BOMI2 train.",
+        repeat_test_seeds=repeat_test_seeds,
     )
-    print(f"[BOMI2→BOMI2 test] AUC: {eval_i2i['auc']:.3f}, Acc: {eval_i2i['accuracy']:.3f}")
+    print(
+        f"[BOMI2→BOMI2 test] AUC: {eval_i2i['auc']:.3f}"
+        + (f" ± {eval_i2i['auc_sem']:.3f}" if repeat_test_seeds > 1 else "")
+        + f", Acc: {eval_i2i['accuracy']:.3f}"
+        + (f" ± {eval_i2i['accuracy_sem']:.3f}" if repeat_test_seeds > 1 else "")
+    )
+    _record_repeated_holdout("original", "BOMI2", "BOMI2", model_name_i, eval_i2i)
 
     print("\n[3] Train BOMI2 train, test BOMI1 test...")
     eval_i2e = _evaluate_and_save_test_run(
@@ -826,8 +1093,15 @@ def run_base_experiments(
         best_params=params_i,
         prediction_path=os.path.join("outputs", "predictions", "pred_internal_train_to_external_test.csv"),
         notes="Permutation importance computed on BOMI1 test set using model trained on BOMI2 train.",
+        repeat_test_seeds=repeat_test_seeds,
     )
-    print(f"[BOMI2→BOMI1 test] AUC: {eval_i2e['auc']:.3f}, Acc: {eval_i2e['accuracy']:.3f}")
+    print(
+        f"[BOMI2→BOMI1 test] AUC: {eval_i2e['auc']:.3f}"
+        + (f" ± {eval_i2e['auc_sem']:.3f}" if repeat_test_seeds > 1 else "")
+        + f", Acc: {eval_i2e['accuracy']:.3f}"
+        + (f" ± {eval_i2e['accuracy_sem']:.3f}" if repeat_test_seeds > 1 else "")
+    )
+    _record_repeated_holdout("original", "BOMI2", "BOMI1", model_name_i, eval_i2e)
     eval_i_on_ext_train = evaluate_fast(df_train_int, df_train_ext, clone(pipe_i))
     summary_rows.append(
         _add_patient_table_label(
@@ -879,8 +1153,15 @@ def run_base_experiments(
         best_params=params_e,
         prediction_path=os.path.join("outputs", "predictions", "pred_external_train_to_external_test.csv"),
         notes="Permutation importance computed on BOMI1 test set using model trained on BOMI1 train.",
+        repeat_test_seeds=repeat_test_seeds,
     )
-    print(f"[BOMI1→BOMI1 test] AUC: {eval_e2e['auc']:.3f}, Acc: {eval_e2e['accuracy']:.3f}")
+    print(
+        f"[BOMI1→BOMI1 test] AUC: {eval_e2e['auc']:.3f}"
+        + (f" ± {eval_e2e['auc_sem']:.3f}" if repeat_test_seeds > 1 else "")
+        + f", Acc: {eval_e2e['accuracy']:.3f}"
+        + (f" ± {eval_e2e['accuracy_sem']:.3f}" if repeat_test_seeds > 1 else "")
+    )
+    _record_repeated_holdout("original", "BOMI1", "BOMI1", model_name_e, eval_e2e)
 
     print("\n[6] Train BOMI1 train, test BOMI2 test...")
     eval_e2i = _evaluate_and_save_test_run(
@@ -894,8 +1175,15 @@ def run_base_experiments(
         best_params=params_e,
         prediction_path=os.path.join("outputs", "predictions", "pred_external_train_to_internal_test.csv"),
         notes="Permutation importance computed on BOMI2 test set using model trained on BOMI1 train.",
+        repeat_test_seeds=repeat_test_seeds,
     )
-    print(f"[BOMI1→BOMI2 test] AUC: {eval_e2i['auc']:.3f}, Acc: {eval_e2i['accuracy']:.3f}")
+    print(
+        f"[BOMI1→BOMI2 test] AUC: {eval_e2i['auc']:.3f}"
+        + (f" ± {eval_e2i['auc_sem']:.3f}" if repeat_test_seeds > 1 else "")
+        + f", Acc: {eval_e2i['accuracy']:.3f}"
+        + (f" ± {eval_e2i['accuracy_sem']:.3f}" if repeat_test_seeds > 1 else "")
+    )
+    _record_repeated_holdout("original", "BOMI1", "BOMI2", model_name_e, eval_e2i)
     eval_e_on_int_train = evaluate_fast(df_train_ext, df_train_int, clone(pipe_e))
     summary_rows.append(
         _add_patient_table_label(
@@ -973,8 +1261,15 @@ def run_base_experiments(
         best_params=params_c,
         prediction_path=os.path.join("outputs", "predictions", "pred_combined_train_to_internal_test.csv"),
         notes="Permutation importance computed on BOMI2 test set using model trained on COMBINED train.",
+        repeat_test_seeds=repeat_test_seeds,
     )
-    print(f"[COMBINED→BOMI2 test] AUC: {eval_c2i['auc']:.3f}, Acc: {eval_c2i['accuracy']:.3f}")
+    print(
+        f"[COMBINED→BOMI2 test] AUC: {eval_c2i['auc']:.3f}"
+        + (f" ± {eval_c2i['auc_sem']:.3f}" if repeat_test_seeds > 1 else "")
+        + f", Acc: {eval_c2i['accuracy']:.3f}"
+        + (f" ± {eval_c2i['accuracy_sem']:.3f}" if repeat_test_seeds > 1 else "")
+    )
+    _record_repeated_holdout("original", "COMBINED", "BOMI2", model_name_c, eval_c2i)
 
     print("\n[9] Train COMBINED train, test BOMI1 test...")
     eval_c2e = _evaluate_and_save_test_run(
@@ -988,8 +1283,15 @@ def run_base_experiments(
         best_params=params_c,
         prediction_path=os.path.join("outputs", "predictions", "pred_combined_train_to_external_test.csv"),
         notes="Permutation importance computed on BOMI1 test set using model trained on COMBINED train.",
+        repeat_test_seeds=repeat_test_seeds,
     )
-    print(f"[COMBINED→BOMI1 test] AUC: {eval_c2e['auc']:.3f}, Acc: {eval_c2e['accuracy']:.3f}")
+    print(
+        f"[COMBINED→BOMI1 test] AUC: {eval_c2e['auc']:.3f}"
+        + (f" ± {eval_c2e['auc_sem']:.3f}" if repeat_test_seeds > 1 else "")
+        + f", Acc: {eval_c2e['accuracy']:.3f}"
+        + (f" ± {eval_c2e['accuracy_sem']:.3f}" if repeat_test_seeds > 1 else "")
+    )
+    _record_repeated_holdout("original", "COMBINED", "BOMI1", model_name_c, eval_c2e)
     summary_rows.append(
         _add_patient_table_label(
             _make_summary_row(
@@ -1054,8 +1356,26 @@ def run_base_experiments(
             use_feature_selection=use_feature_selection,
         )
         eval_i_align_on_ext_train = evaluate_fast(df_train_int_aligned, df_train_ext, clone(pipe_i_align))
-        eval_i_align_on_int_test = evaluate_on_test_set(df_train_int_aligned, df_test_int_aligned, clone(pipe_i_align))
-        eval_i_align_on_ext_test = evaluate_on_test_set(df_train_int_aligned, df_test_ext, clone(pipe_i_align))
+        eval_i_align_on_int_test = evaluate_on_test_set_repeated(
+            df_train_int_aligned, df_test_int_aligned, clone(pipe_i_align), repeat_test_seeds=repeat_test_seeds
+        )
+        eval_i_align_on_ext_test = evaluate_on_test_set_repeated(
+            df_train_int_aligned, df_test_ext, clone(pipe_i_align), repeat_test_seeds=repeat_test_seeds
+        )
+        _save_repeated_holdout_outputs(
+            eval_dict=eval_i_align_on_int_test,
+            cohort="BOMI2",
+            regime=f"{label_int_to_ext}__train_internal__test_internal",
+            model_name=str(model_name_i),
+        )
+        _save_repeated_holdout_outputs(
+            eval_dict=eval_i_align_on_ext_test,
+            cohort="BOMI2",
+            regime=f"{label_int_to_ext}__train_internal__test_external",
+            model_name=str(model_name_i),
+        )
+        _record_repeated_holdout(label_int_to_ext, "BOMI2", "BOMI2", model_name_i, eval_i_align_on_int_test)
+        _record_repeated_holdout(label_int_to_ext, "BOMI2", "BOMI1", model_name_i, eval_i_align_on_ext_test)
         summary_rows.append(
             _add_patient_table_label(
                 _make_summary_row(
@@ -1075,7 +1395,16 @@ def run_base_experiments(
         )
 
         eval_e_on_int_train_aligned = evaluate_fast(df_train_ext, df_train_int_aligned, clone(pipe_e))
-        eval_e_on_int_test_aligned = evaluate_on_test_set(df_train_ext, df_test_int_aligned, clone(pipe_e))
+        eval_e_on_int_test_aligned = evaluate_on_test_set_repeated(
+            df_train_ext, df_test_int_aligned, clone(pipe_e), repeat_test_seeds=repeat_test_seeds
+        )
+        _save_repeated_holdout_outputs(
+            eval_dict=eval_e_on_int_test_aligned,
+            cohort="BOMI1",
+            regime=f"{label_int_to_ext}__train_external__test_internal",
+            model_name=str(model_name_e),
+        )
+        _record_repeated_holdout(label_int_to_ext, "BOMI1", "BOMI2", model_name_e, eval_e_on_int_test_aligned)
         summary_rows.append(
             _add_patient_table_label(
                 _make_summary_row(
@@ -1119,8 +1448,26 @@ def run_base_experiments(
             target="EXTERNAL",
             n_folds=5,
         )
-        eval_ci_align_on_int_test = evaluate_on_test_set(combined_train_i_align, df_test_int_aligned, clone(pipe_ci_align))
-        eval_ci_align_on_ext_test = evaluate_on_test_set(combined_train_i_align, df_test_ext, clone(pipe_ci_align))
+        eval_ci_align_on_int_test = evaluate_on_test_set_repeated(
+            combined_train_i_align, df_test_int_aligned, clone(pipe_ci_align), repeat_test_seeds=repeat_test_seeds
+        )
+        eval_ci_align_on_ext_test = evaluate_on_test_set_repeated(
+            combined_train_i_align, df_test_ext, clone(pipe_ci_align), repeat_test_seeds=repeat_test_seeds
+        )
+        _save_repeated_holdout_outputs(
+            eval_dict=eval_ci_align_on_int_test,
+            cohort="COMBINED",
+            regime=f"{label_int_to_ext}__train_combined__test_internal",
+            model_name=str(model_name_c),
+        )
+        _save_repeated_holdout_outputs(
+            eval_dict=eval_ci_align_on_ext_test,
+            cohort="COMBINED",
+            regime=f"{label_int_to_ext}__train_combined__test_external",
+            model_name=str(model_name_c),
+        )
+        _record_repeated_holdout(label_int_to_ext, "COMBINED", "BOMI2", model_name_c, eval_ci_align_on_int_test)
+        _record_repeated_holdout(label_int_to_ext, "COMBINED", "BOMI1", model_name_c, eval_ci_align_on_ext_test)
         summary_rows.append(
             _add_patient_table_label(
                 _make_summary_row(
@@ -1172,7 +1519,16 @@ def run_base_experiments(
             )
         )
         eval_i_on_ext_train_aligned = evaluate_fast(df_train_int, df_train_ext_aligned, clone(pipe_i))
-        eval_i_on_ext_test_aligned = evaluate_on_test_set(df_train_int, df_test_ext_aligned, clone(pipe_i))
+        eval_i_on_ext_test_aligned = evaluate_on_test_set_repeated(
+            df_train_int, df_test_ext_aligned, clone(pipe_i), repeat_test_seeds=repeat_test_seeds
+        )
+        _save_repeated_holdout_outputs(
+            eval_dict=eval_i_on_ext_test_aligned,
+            cohort="BOMI2",
+            regime=f"{label_ext_to_int}__train_internal__test_external",
+            model_name=str(model_name_i),
+        )
+        _record_repeated_holdout(label_ext_to_int, "BOMI2", "BOMI1", model_name_i, eval_i_on_ext_test_aligned)
         summary_rows.append(
             _add_patient_table_label(
                 _make_summary_row(
@@ -1199,8 +1555,26 @@ def run_base_experiments(
             use_feature_selection=use_feature_selection,
         )
         eval_e_align_on_int_train = evaluate_fast(df_train_ext_aligned, df_train_int, clone(pipe_e_align))
-        eval_e_align_on_int_test = evaluate_on_test_set(df_train_ext_aligned, df_test_int, clone(pipe_e_align))
-        eval_e_align_on_ext_test = evaluate_on_test_set(df_train_ext_aligned, df_test_ext_aligned, clone(pipe_e_align))
+        eval_e_align_on_int_test = evaluate_on_test_set_repeated(
+            df_train_ext_aligned, df_test_int, clone(pipe_e_align), repeat_test_seeds=repeat_test_seeds
+        )
+        eval_e_align_on_ext_test = evaluate_on_test_set_repeated(
+            df_train_ext_aligned, df_test_ext_aligned, clone(pipe_e_align), repeat_test_seeds=repeat_test_seeds
+        )
+        _save_repeated_holdout_outputs(
+            eval_dict=eval_e_align_on_int_test,
+            cohort="BOMI1",
+            regime=f"{label_ext_to_int}__train_external__test_internal",
+            model_name=str(model_name_e),
+        )
+        _save_repeated_holdout_outputs(
+            eval_dict=eval_e_align_on_ext_test,
+            cohort="BOMI1",
+            regime=f"{label_ext_to_int}__train_external__test_external",
+            model_name=str(model_name_e),
+        )
+        _record_repeated_holdout(label_ext_to_int, "BOMI1", "BOMI2", model_name_e, eval_e_align_on_int_test)
+        _record_repeated_holdout(label_ext_to_int, "BOMI1", "BOMI1", model_name_e, eval_e_align_on_ext_test)
         summary_rows.append(
             _add_patient_table_label(
                 _make_summary_row(
@@ -1245,8 +1619,26 @@ def run_base_experiments(
             target="EXTERNAL",
             n_folds=5,
         )
-        eval_ce_align_on_int_test = evaluate_on_test_set(combined_train_e_align, df_test_int, clone(pipe_ce_align))
-        eval_ce_align_on_ext_test = evaluate_on_test_set(combined_train_e_align, df_test_ext_aligned, clone(pipe_ce_align))
+        eval_ce_align_on_int_test = evaluate_on_test_set_repeated(
+            combined_train_e_align, df_test_int, clone(pipe_ce_align), repeat_test_seeds=repeat_test_seeds
+        )
+        eval_ce_align_on_ext_test = evaluate_on_test_set_repeated(
+            combined_train_e_align, df_test_ext_aligned, clone(pipe_ce_align), repeat_test_seeds=repeat_test_seeds
+        )
+        _save_repeated_holdout_outputs(
+            eval_dict=eval_ce_align_on_int_test,
+            cohort="COMBINED",
+            regime=f"{label_ext_to_int}__train_combined__test_internal",
+            model_name=str(model_name_c),
+        )
+        _save_repeated_holdout_outputs(
+            eval_dict=eval_ce_align_on_ext_test,
+            cohort="COMBINED",
+            regime=f"{label_ext_to_int}__train_combined__test_external",
+            model_name=str(model_name_c),
+        )
+        _record_repeated_holdout(label_ext_to_int, "COMBINED", "BOMI2", model_name_c, eval_ce_align_on_int_test)
+        _record_repeated_holdout(label_ext_to_int, "COMBINED", "BOMI1", model_name_c, eval_ce_align_on_ext_test)
         summary_rows.append(
             _add_patient_table_label(
                 _make_summary_row(
@@ -1285,6 +1677,7 @@ def run_base_experiments(
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     summary_df.to_csv(out_csv, index=False)
     print(f"\n[SUMMARY] Saved cohort mixing summary to {out_csv}")
+    save_final_report_tables(summary_df)
 
     if run_feature_alignment and alignment_diag_rows:
         diag_path = os.path.join("outputs", "metrics", "feature_alignment_diagnostics.csv")
@@ -1295,6 +1688,11 @@ def run_base_experiments(
         shift_path = os.path.join("outputs", "metrics", "feature_alignment_shift_summary.csv")
         pd.DataFrame(alignment_shift_rows).to_csv(shift_path, index=False)
         print(f"[ALIGN] Saved feature-shift summary to {shift_path}")
+
+    if repeated_holdout_rows:
+        repeated_holdout_path = os.path.join("outputs", "metrics", "cohort_mixing_summary_repeated_holdout.csv")
+        pd.DataFrame(repeated_holdout_rows).to_csv(repeated_holdout_path, index=False)
+        print(f"[SUMMARY] Saved repeated holdout summary to {repeated_holdout_path}")
 
     print("\n[INFO] Base experiments completed.")
 
@@ -1319,6 +1717,12 @@ def build_argparser() -> argparse.ArgumentParser:
     # Modeling
     p.add_argument("--no-hyperparameter-tuning", action="store_true")
     p.add_argument("--no-feature-selection", action="store_true")
+    p.add_argument(
+        "--repeat-test-seeds",
+        type=int,
+        default=1,
+        help="Repeat each fixed holdout test evaluation across N consecutive seeds and report mean ± SEM.",
+    )
     p.add_argument("--run-feature-alignment", action="store_true")
     p.add_argument("--feature-alignment-method", type=str, default="meanstd", choices=["meanstd", "robust_iqr", "quantile", "coral"])
     p.add_argument("--feature-alignment-coral-shrinkage", type=float, default=0.1)
@@ -1380,9 +1784,30 @@ def main() -> None:
         feature_alignment_coral_shrinkage=args.feature_alignment_coral_shrinkage,
         feature_alignment_coral_eig_floor=args.feature_alignment_coral_eig_floor,
         feature_alignment_quantile_n_quantiles=args.feature_alignment_quantile_n_quantiles,
+        repeat_test_seeds=args.repeat_test_seeds,
     )
 
     if args.run_learning_curve:
+        learning_fit_alignment_fn = None
+        learning_apply_alignment_fn = None
+        learning_alignment_method = None
+        learning_alignment_kwargs = None
+
+        if args.run_feature_alignment:
+            if args.feature_alignment_method not in {"meanstd", "robust_iqr"}:
+                raise ValueError(
+                    "--run-learning-curve currently supports --run-feature-alignment only for "
+                    "'meanstd' and 'robust_iqr'."
+                )
+            learning_fit_alignment_fn = fit_feature_alignment
+            learning_apply_alignment_fn = apply_feature_alignment
+            learning_alignment_method = args.feature_alignment_method
+            learning_alignment_kwargs = {
+                "coral_shrinkage": args.feature_alignment_coral_shrinkage,
+                "coral_eig_floor": args.feature_alignment_coral_eig_floor,
+                "quantile_n_quantiles": args.feature_alignment_quantile_n_quantiles,
+            }
+
         if args.learning_train_sizes_internal.strip():
             sizes_int = parse_train_sizes(args.learning_train_sizes_internal, n_train=len(df_train_int))
         else:
@@ -1416,6 +1841,10 @@ def main() -> None:
                 use_feature_selection=use_feature_selection,
             ),
             prefix_ids_fn=_prefix_ids,
+            fit_feature_alignment_fn=learning_fit_alignment_fn,
+            apply_feature_alignment_fn=learning_apply_alignment_fn,
+            feature_alignment_method=learning_alignment_method,
+            feature_alignment_kwargs=learning_alignment_kwargs,
             n_jobs=args.n_jobs,
         )
 
