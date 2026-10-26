@@ -73,18 +73,18 @@ def test_select_feature_panel_caps_redundant_feature_families(matched_module):
     shift_summary = pd.DataFrame(
         {
             "feature": [
-                "cancer_ripley_L_20.0",
-                "cancer_ripley_L_40.0",
-                "stroma_ripley_L_20.0",
-                "tumor_to_stroma_mean_dist",
-                "degree_centrality_ratio",
+                "cancer_ripley_L_auc",
+                "stroma_ripley_L_auc",
+                "cancer_degree_centrality",
+                "cancer_stroma_cooccurrence_auc",
+                "cancer_stroma_cooccurrence_deviation_auc",
             ],
             "family": [
                 "cancer_ripley",
-                "cancer_ripley",
                 "stroma_ripley",
-                "interface_distance",
-                "centrality_ratio",
+                "centrality_score",
+                "cell_type_cooccurrence_ratio",
+                "cell_type_cooccurrence_ratio",
             ],
             "cohens_d": [1.5, 1.4, 1.3, 1.2, 1.1],
             "abs_cohens_d": [1.5, 1.4, 1.3, 1.2, 1.1],
@@ -97,10 +97,10 @@ def test_select_feature_panel_caps_redundant_feature_families(matched_module):
     panel = matched_module.select_feature_panel(shift_summary, panel_size=4, max_per_family=1)
 
     assert panel["feature"].tolist() == [
-        "cancer_ripley_L_20.0",
-        "stroma_ripley_L_20.0",
-        "tumor_to_stroma_mean_dist",
-        "degree_centrality_ratio",
+        "cancer_ripley_L_auc",
+        "stroma_ripley_L_auc",
+        "cancer_degree_centrality",
+        "cancer_stroma_cooccurrence_auc",
     ]
 
 
@@ -108,21 +108,21 @@ def test_build_feature_targets_and_scoring_follow_quantile_matching(matched_modu
     internal = pd.DataFrame(
         {
             "sample_name": ["s1", "s2", "s3"],
-            "tumor_to_stroma_mean_dist": [10.0, 20.0, 30.0],
-            "degree_centrality_ratio": [1.0, 2.0, 3.0],
+            "cancer_degree_centrality": [10.0, 20.0, 30.0],
+            "cancer_stroma_neighborhood_enrichment_zscore": [1.0, 2.0, 3.0],
         }
     )
     external = pd.DataFrame(
         {
             "sample_name": ["e1", "e2", "e3"],
-            "tumor_to_stroma_mean_dist": [40.0, 50.0, 60.0],
-            "degree_centrality_ratio": [4.0, 5.0, 6.0],
+            "cancer_degree_centrality": [40.0, 50.0, 60.0],
+            "cancer_stroma_neighborhood_enrichment_zscore": [4.0, 5.0, 6.0],
         }
     )
     panel = pd.DataFrame(
         {
-            "feature": ["tumor_to_stroma_mean_dist", "degree_centrality_ratio"],
-            "family": ["interface_distance", "centrality_ratio"],
+            "feature": ["cancer_degree_centrality", "cancer_stroma_neighborhood_enrichment_zscore"],
+            "family": ["centrality_score", "neighborhood_enrichment"],
             "cohens_d": [1.5, 1.0],
             "abs_cohens_d": [1.5, 1.0],
             "mean_internal": [20.0, 2.0],
@@ -133,16 +133,19 @@ def test_build_feature_targets_and_scoring_follow_quantile_matching(matched_modu
 
     targets, scales, weights = matched_module.build_feature_targets(internal, external, panel)
 
-    assert np.isclose(targets["s1"]["tumor_to_stroma_mean_dist"], 43.333333333333336)
-    assert np.isclose(targets["s2"]["tumor_to_stroma_mean_dist"], 50.0)
-    assert np.isclose(targets["s3"]["tumor_to_stroma_mean_dist"], 56.666666666666664)
-    assert np.isclose(scales["degree_centrality_ratio"], 1.0)
-    assert np.isclose(weights["tumor_to_stroma_mean_dist"] + weights["degree_centrality_ratio"], 1.0)
+    assert np.isclose(targets["s1"]["cancer_degree_centrality"], 43.333333333333336)
+    assert np.isclose(targets["s2"]["cancer_degree_centrality"], 50.0)
+    assert np.isclose(targets["s3"]["cancer_degree_centrality"], 56.666666666666664)
+    assert np.isclose(scales["cancer_stroma_neighborhood_enrichment_zscore"], 1.0)
+    assert np.isclose(
+        weights["cancer_degree_centrality"] + weights["cancer_stroma_neighborhood_enrichment_zscore"],
+        1.0,
+    )
 
     perfect_score = matched_module.score_feature_candidate(
         {
-            "tumor_to_stroma_mean_dist": targets["s1"]["tumor_to_stroma_mean_dist"],
-            "degree_centrality_ratio": targets["s1"]["degree_centrality_ratio"],
+            "cancer_degree_centrality": targets["s1"]["cancer_degree_centrality"],
+            "cancer_stroma_neighborhood_enrichment_zscore": targets["s1"]["cancer_stroma_neighborhood_enrichment_zscore"],
         },
         targets["s1"],
         scales,
@@ -150,8 +153,8 @@ def test_build_feature_targets_and_scoring_follow_quantile_matching(matched_modu
     )
     worse_score = matched_module.score_feature_candidate(
         {
-            "tumor_to_stroma_mean_dist": 55.0,
-            "degree_centrality_ratio": 6.0,
+            "cancer_degree_centrality": 55.0,
+            "cancer_stroma_neighborhood_enrichment_zscore": 6.0,
         },
         targets["s1"],
         scales,
@@ -164,23 +167,20 @@ def test_build_feature_targets_and_scoring_follow_quantile_matching(matched_modu
 
 def test_predict_keep_adjustments_responds_to_feature_direction(matched_module):
     baseline = {
-        "tumor_to_stroma_mean_dist": 30.0,
-        "stroma_ripley_L_20.0": 14.0,
-        "cancer_ripley_L_20.0": 10.0,
-        "degree_centrality_ratio": 0.8,
+        "stroma_ripley_L_auc": 14.0,
+        "cancer_ripley_L_auc": 10.0,
+        "cancer_degree_centrality": 0.8,
     }
     target = {
-        "tumor_to_stroma_mean_dist": 50.0,
-        "stroma_ripley_L_20.0": 10.0,
-        "cancer_ripley_L_20.0": 16.0,
-        "degree_centrality_ratio": 1.2,
+        "stroma_ripley_L_auc": 10.0,
+        "cancer_ripley_L_auc": 16.0,
+        "cancer_degree_centrality": 1.2,
     }
     scales = {k: 1.0 for k in baseline}
     weights = {
-        "tumor_to_stroma_mean_dist": 0.4,
-        "stroma_ripley_L_20.0": 0.3,
-        "cancer_ripley_L_20.0": 0.2,
-        "degree_centrality_ratio": 0.1,
+        "stroma_ripley_L_auc": 0.5,
+        "cancer_ripley_L_auc": 0.3,
+        "cancer_degree_centrality": 0.2,
     }
 
     keep_c_mult, keep_s_mult = matched_module.predict_keep_adjustments(baseline, target, scales, weights)

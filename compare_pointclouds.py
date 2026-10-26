@@ -46,8 +46,7 @@ from scipy.spatial import cKDTree
 
 # Your metric utilities (operate in pixel units here)
 from spatial_metrics import (
-    calculate_ripley_l,
-    calculate_bidirectional_min_distance,
+    calculate_ripley_l_curve,
     calculate_newmans_assortativity,
 )
 
@@ -453,18 +452,39 @@ def thin_cellpose_to_match_external_nnd_calibrated(
 # Per-sample metrics (pixel units)
 # ---------------------------
 
+def calculate_bidirectional_min_distance_local(coords: np.ndarray, cell_types: np.ndarray) -> Dict[str, float]:
+    """Local comparison-only mean interface distances.
+
+    These are intentionally kept outside spatial_metrics.py because they are not
+    part of the Behanova manuscript feature panel.
+    """
+
+    cancer = coords[cell_types == 1]
+    stroma = coords[cell_types == 0]
+    if len(cancer) == 0 or len(stroma) == 0:
+        return {
+            "stroma_to_tumor_mean_dist": 0.0,
+            "tumor_to_stroma_mean_dist": 0.0,
+        }
+    stroma_to_tumor, _ = cKDTree(cancer).query(stroma, k=1)
+    tumor_to_stroma, _ = cKDTree(stroma).query(cancer, k=1)
+    return {
+        "stroma_to_tumor_mean_dist": float(np.mean(stroma_to_tumor)),
+        "tumor_to_stroma_mean_dist": float(np.mean(tumor_to_stroma)),
+    }
+
 def per_sample_metrics(coords: np.ndarray, types: np.ndarray, assort_radius: float) -> Dict[str, float]:
     out: Dict[str, float] = {}
     out["n_cells"] = float(len(types))
     out["ck_pos_prop"] = float(types.mean() if len(types) else 0.0)
 
-    bdm = calculate_bidirectional_min_distance(coords, types)  # pixel units
+    bdm = calculate_bidirectional_min_distance_local(coords, types)  # pixel units
     out["mean_min_stroma_to_tumor"] = float(bdm["stroma_to_tumor_mean_dist"])
     out["mean_min_tumor_to_stroma"] = float(bdm["tumor_to_stroma_mean_dist"])
 
     out["assortativity_r"] = float(calculate_newmans_assortativity(coords, types, radius=assort_radius))
 
-    rdict = calculate_ripley_l(coords, types)  # uses pixel radii internally
+    rdict = calculate_ripley_l_curve(coords, types)  # uses pixel radii internally
     bins, Lc, Ls = extract_ripley_vectors(rdict)
     out["_ripley_bins"] = bins
     out["_ripley_cancer"] = Lc
@@ -617,6 +637,23 @@ def run_external_vs_internal_density(
     return all_dens
 
 
+def filter_histogram_nnd_rows(df: pd.DataFrame, max_nnd: float | None) -> pd.DataFrame:
+    if max_nnd is None:
+        return df
+
+    out = df.copy()
+    for col in ["median_nnd_all", "median_nnd_cancer", "median_nnd_stroma"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    keep = pd.Series(True, index=out.index)
+    present = [col for col in ["median_nnd_all", "median_nnd_cancer", "median_nnd_stroma"] if col in out.columns]
+    for col in present:
+        keep &= out[col].isna() | (out[col] <= float(max_nnd))
+
+    return out.loc[keep].copy()
+
+
 def plot_density_histograms(df, metric, out_png, log_bins=False, n_bins=60, clip_q=None):
     """
     log_bins=True  -> use logarithmically spaced bin edges (more resolution for small values)
@@ -692,6 +729,15 @@ def main():
         default="data/raw/BOMI1_cells_all.csv",
         help="External cohort cell CSV (e.g. BOMI1_cells_all.csv)."
     )
+    ap.add_argument(
+        "--hist-max-nnd",
+        type=float,
+        default=None,
+        help=(
+            "Optional histogram-only filter for --external-vs-internal. "
+            "Exclude cores whose median NND exceeds this threshold before plotting."
+        ),
+    )
     args = ap.parse_args()
     Path(args.out_prefix).parent.mkdir(parents=True, exist_ok=True)
 
@@ -717,20 +763,27 @@ def main():
             out_prefix=args.out_prefix,
         )
 
+        hist_dens = filter_histogram_nnd_rows(all_dens, args.hist_max_nnd)
+        if args.hist_max_nnd is not None:
+            print(
+                f"[INFO] Histogram-only NND filter: kept {len(hist_dens)}/{len(all_dens)} cores "
+                f"with median NND <= {args.hist_max_nnd:g}."
+            )
+
         # Example plots
         plot_density_histograms(
-            all_dens,
+            hist_dens,
             metric="median_nnd_all",
             out_png=f"{args.out_prefix}_median_nnd_all.png",
             log_bins=True
         )
         plot_density_histograms(
-            all_dens,
+            hist_dens,
             metric="median_nnd_cancer",
             out_png=f"{args.out_prefix}_median_nnd_cancer.png",
         )
         plot_density_histograms(
-            all_dens,
+            hist_dens,
             metric="median_nnd_stroma",
             out_png=f"{args.out_prefix}_median_nnd_stroma.png",
         )

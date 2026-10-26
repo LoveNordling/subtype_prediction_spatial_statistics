@@ -283,4 +283,16 @@ def aggregate_cores_to_patient(metrics_per_core: pd.DataFrame) -> pd.DataFrame:
 
 def get_feature_columns(df: pd.DataFrame) -> List[str]:
     drop = {"ID", "label", "cell_count", "cancer_count", "stroma_count"}
+    try:
+        from spatial_metrics import BEHANOVA_FEATURE_COLUMNS
+
+        locked = [
+            col
+            for col in BEHANOVA_FEATURE_COLUMNS
+            if col in df.columns and pd.api.types.is_numeric_dtype(df[col])
+        ]
+        if locked:
+            return locked
+    except Exception:
+        pass
     return [c for c in df.select_dtypes(include=[np.number]).columns if c not in drop]

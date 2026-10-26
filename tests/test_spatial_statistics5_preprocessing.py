@@ -200,63 +200,7 @@ def test_spatial_data_pipeline_sorts_metrics_and_patients_deterministically(spat
     assert sorted_patients["ID"].tolist() == ["p1", "p2"]
 
 
-def test_feature_alignment_coral_handles_colinear_features(spatial_statistics5_module):
-    rng = np.random.default_rng(7)
-    latent = rng.normal(size=(120, 2))
-    source = np.column_stack(
-        [
-            latent[:, 0],
-            2.0 * latent[:, 0] + 0.01 * rng.normal(size=120),
-            latent[:, 1],
-            latent[:, 0] + latent[:, 1] + 0.01 * rng.normal(size=120),
-        ]
-    )
-
-    mixing = np.array(
-        [
-            [1.2, 0.3, 0.0, 0.4],
-            [0.1, 0.8, 0.5, 0.2],
-            [0.3, 0.0, 1.1, 0.2],
-            [0.2, 0.1, 0.4, 1.0],
-        ]
-    )
-    shift = np.array([1.5, -0.8, 0.7, 2.0])
-    target = source @ mixing + shift + 0.02 * rng.normal(size=source.shape)
-
-    feat_cols = ["f1", "f2", "f3", "f4"]
-    source_df = pd.DataFrame(source, columns=feat_cols)
-    target_df = pd.DataFrame(target, columns=feat_cols)
-
-    alignment = spatial_statistics5_module.fit_feature_alignment(
-        source_df,
-        target_df,
-        feat_cols,
-        method="coral",
-        coral_shrinkage=0.2,
-        coral_eig_floor=1e-5,
-    )
-    aligned = spatial_statistics5_module.apply_feature_alignment(
-        source_df,
-        feat_cols,
-        alignment,
-        method="coral",
-    )
-
-    source_cov = np.cov(source_df[feat_cols].to_numpy(float), rowvar=False)
-    target_cov = np.cov(target_df[feat_cols].to_numpy(float), rowvar=False)
-    aligned_cov = np.cov(aligned[feat_cols].to_numpy(float), rowvar=False)
-
-    before_mean_gap = np.linalg.norm(source_df[feat_cols].mean().to_numpy() - target_df[feat_cols].mean().to_numpy())
-    after_mean_gap = np.linalg.norm(aligned[feat_cols].mean().to_numpy() - target_df[feat_cols].mean().to_numpy())
-    before_cov_gap = np.linalg.norm(source_cov - target_cov, ord="fro")
-    after_cov_gap = np.linalg.norm(aligned_cov - target_cov, ord="fro")
-
-    assert np.isfinite(aligned[feat_cols].to_numpy()).all()
-    assert after_mean_gap < before_mean_gap * 0.05
-    assert after_cov_gap < before_cov_gap * 0.6
-
-
-def test_feature_alignment_quantile_matches_marginals(spatial_statistics5_module):
+def test_feature_alignment_meanstd_matches_target_mean_and_std(spatial_statistics5_module):
     rng = np.random.default_rng(11)
     feat_cols = ["f1", "f2"]
     source = pd.DataFrame(
@@ -276,28 +220,61 @@ def test_feature_alignment_quantile_matches_marginals(spatial_statistics5_module
         source,
         target,
         feat_cols,
-        method="quantile",
-        quantile_n_quantiles=101,
+        method="meanstd",
     )
     aligned = spatial_statistics5_module.apply_feature_alignment(
         source,
         feat_cols,
         alignment,
-        method="quantile",
+        method="meanstd",
     )
 
-    quantiles = np.array([0.1, 0.25, 0.5, 0.75, 0.9])
-    before_gap = 0.0
-    after_gap = 0.0
-    for feat in feat_cols:
-        src_q = np.quantile(source[feat].to_numpy(float), quantiles)
-        aligned_q = np.quantile(aligned[feat].to_numpy(float), quantiles)
-        tgt_q = np.quantile(target[feat].to_numpy(float), quantiles)
-        before_gap += float(np.mean(np.abs(src_q - tgt_q)))
-        after_gap += float(np.mean(np.abs(aligned_q - tgt_q)))
+    assert np.isfinite(aligned[feat_cols].to_numpy()).all()
+    assert np.allclose(aligned[feat_cols].mean().to_numpy(), target[feat_cols].mean().to_numpy())
+    assert np.allclose(aligned[feat_cols].std(ddof=0).to_numpy(), target[feat_cols].std(ddof=0).to_numpy())
+
+
+def test_feature_alignment_median_iqr_matches_target_median_and_iqr(spatial_statistics5_module):
+    rng = np.random.default_rng(12)
+    feat_cols = ["f1", "f2"]
+    source = pd.DataFrame(
+        {
+            "f1": rng.normal(loc=0.0, scale=1.0, size=400),
+            "f2": rng.exponential(scale=1.0, size=400),
+        }
+    )
+    target = pd.DataFrame(
+        {
+            "f1": rng.normal(loc=2.5, scale=0.6, size=400),
+            "f2": rng.gamma(shape=2.0, scale=1.5, size=400),
+        }
+    )
+
+    alignment = spatial_statistics5_module.fit_feature_alignment(
+        source,
+        target,
+        feat_cols,
+        method="median_iqr",
+    )
+    aligned = spatial_statistics5_module.apply_feature_alignment(
+        source,
+        feat_cols,
+        alignment,
+        method="median_iqr",
+    )
+
+    aligned_median = np.median(aligned[feat_cols].to_numpy(float), axis=0)
+    target_median = np.median(target[feat_cols].to_numpy(float), axis=0)
+    aligned_iqr = np.percentile(aligned[feat_cols].to_numpy(float), 75, axis=0) - np.percentile(
+        aligned[feat_cols].to_numpy(float), 25, axis=0
+    )
+    target_iqr = np.percentile(target[feat_cols].to_numpy(float), 75, axis=0) - np.percentile(
+        target[feat_cols].to_numpy(float), 25, axis=0
+    )
 
     assert np.isfinite(aligned[feat_cols].to_numpy()).all()
-    assert after_gap < before_gap * 0.2
+    assert np.allclose(aligned_median, target_median)
+    assert np.allclose(aligned_iqr, target_iqr)
 
 
 def test_repeat_test_seed_helpers_return_summary(spatial_statistics5_module):
@@ -344,6 +321,45 @@ def test_repeat_test_seed_helpers_return_summary(spatial_statistics5_module):
     assert list(repeated["repeat_metrics"].columns) == ["seed", "auc", "accuracy"]
     assert len(repeated["repeat_metrics"]) == 3
     assert {"feature", "importance", "importance_sem"}.issubset(repeated["feature_importance"].columns)
+
+
+def test_nested_cv_returns_out_of_fold_estimate_and_outputs(spatial_statistics5_module, tmp_path):
+    mod = spatial_statistics5_module
+
+    train_df = pd.DataFrame(
+        {
+            "ID": [f"p{i}" for i in range(12)],
+            "label": [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1],
+            "cell_count": [10] * 12,
+            "cancer_count": [5] * 12,
+            "stroma_count": [5] * 12,
+            "feat_a": [0.0, 0.1, 0.2, 0.15, 0.05, 0.25, 1.0, 1.1, 1.2, 1.15, 1.05, 1.25],
+            "feat_b": [0.2, 0.0, 0.1, 0.18, 0.08, 0.22, 0.9, 1.0, 1.1, 1.08, 0.98, 1.18],
+        }
+    )
+
+    nested = mod.run_nested_classification_cv(
+        train_df,
+        outer_folds=3,
+        inner_folds=2,
+        hyperparameter_tuning=False,
+        use_feature_selection=False,
+    )
+
+    assert nested["outer_folds"] == 3
+    assert nested["requested_outer_folds"] == 3
+    assert nested["requested_inner_folds"] == 2
+    assert len(nested["fold_metrics"]) == 3
+    assert len(nested["predictions"]) == 12
+    assert set(nested["predictions"]["ID"]) == set(train_df["ID"])
+    assert nested["fold_metrics"]["model_name"].eq("LogisticRegression (default)").all()
+    assert 0.0 <= nested["auc_mean"] <= 1.0
+
+    paths = mod.save_nested_cv_outputs(nested, cohort="BOMI2", out_dir=str(tmp_path))
+    assert set(paths) == {"fold_metrics", "predictions", "summary"}
+    summary = pd.read_csv(paths["summary"])
+    assert summary.loc[0, "cohort"] == "BOMI2"
+    assert int(summary.loc[0, "n_patients"]) == 12
 
 
 def test_build_final_report_table_matches_within_deltas(spatial_statistics5_module):
@@ -420,3 +436,94 @@ def test_build_final_report_table_matches_within_deltas(spatial_statistics5_modu
 
     aligned_report_df = mod.build_final_report_table(summary_df, "aligned_BOMI2_to_BOMI1_meanstd")
     assert aligned_report_df["ΔAUC vs within"].tolist() == pytest.approx([0.0, 0.0, -0.082, -0.120, -0.050, 0.008])
+
+
+def test_feature_direction_policy_drops_discordant_features(spatial_statistics5_module, tmp_path):
+    mod = spatial_statistics5_module
+
+    df_train_int = pd.DataFrame(
+        {
+            "ID": ["i0", "i1", "i2", "i3"],
+            "label": [0, 0, 1, 1],
+            "feature_same": [0.0, 0.2, 1.0, 1.2],
+            "feature_flip": [1.0, 1.2, 0.0, 0.2],
+        }
+    )
+    df_test_int = df_train_int.copy()
+    df_train_ext = pd.DataFrame(
+        {
+            "ID": ["e0", "e1", "e2", "e3"],
+            "label": [0, 0, 1, 1],
+            "feature_same": [0.1, 0.3, 1.1, 1.3],
+            "feature_flip": [0.1, 0.3, 1.1, 1.3],
+        }
+    )
+    df_test_ext = df_train_ext.copy()
+
+    out_i, out_it, out_e, out_et, report = mod.apply_feature_direction_policy(
+        df_train_int,
+        df_test_int,
+        df_train_ext,
+        df_test_ext,
+        "keep-consistent",
+        out_dir=str(tmp_path),
+    )
+
+    assert "feature_same" in out_i.columns
+    assert "feature_flip" not in out_i.columns
+    assert "feature_flip" not in out_it.columns
+    assert "feature_flip" not in out_e.columns
+    assert "feature_flip" not in out_et.columns
+    flip = report.set_index("feature").loc["feature_flip"]
+    assert bool(flip["discordant"])
+    assert flip["action"] == "drop"
+    assert (tmp_path / "feature_direction_consistency__keep-consistent.csv").exists()
+
+
+def test_feature_direction_policy_inverts_discordant_internal_features(spatial_statistics5_module, tmp_path):
+    mod = spatial_statistics5_module
+
+    df_train_int = pd.DataFrame(
+        {
+            "ID": ["i0", "i1", "i2", "i3"],
+            "label": [0, 0, 1, 1],
+            "feature_same": [0.0, 0.2, 1.0, 1.2],
+            "feature_flip": [1.0, 1.2, 0.0, 0.2],
+        }
+    )
+    df_test_int = pd.DataFrame(
+        {
+            "ID": ["it0", "it1"],
+            "label": [0, 1],
+            "feature_same": [0.4, 0.8],
+            "feature_flip": [2.0, 3.0],
+        }
+    )
+    df_train_ext = pd.DataFrame(
+        {
+            "ID": ["e0", "e1", "e2", "e3"],
+            "label": [0, 0, 1, 1],
+            "feature_same": [0.1, 0.3, 1.1, 1.3],
+            "feature_flip": [0.1, 0.3, 1.1, 1.3],
+        }
+    )
+    df_test_ext = df_train_ext.copy()
+
+    out_i, out_it, out_e, out_et, report = mod.apply_feature_direction_policy(
+        df_train_int,
+        df_test_int,
+        df_train_ext,
+        df_test_ext,
+        "invert-discordant",
+        invert_cohort="internal",
+        out_dir=str(tmp_path),
+    )
+
+    assert out_i["feature_flip"].tolist() == [-1.0, -1.2, -0.0, -0.2]
+    assert out_it["feature_flip"].tolist() == [-2.0, -3.0]
+    assert out_e["feature_flip"].tolist() == df_train_ext["feature_flip"].tolist()
+    assert out_et["feature_flip"].tolist() == df_test_ext["feature_flip"].tolist()
+    flip = report.set_index("feature").loc["feature_flip"]
+    assert bool(flip["discordant"])
+    assert flip["action"] == "invert_internal"
+    assert (tmp_path / "feature_direction_consistency__invert-discordant.csv").exists()

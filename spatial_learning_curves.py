@@ -240,8 +240,24 @@ def _summarize_learning(raw_df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def _display_cohort_name(cohort: str) -> str:
+    return {
+        "BOMI2": "mIF",
+        "BOMI1": "H&E",
+    }.get(cohort, cohort)
+
+
+def _learning_regime_label(primary: str, secondary: str, regime: str) -> str:
+    primary_label = _display_cohort_name(primary)
+    secondary_label = _display_cohort_name(secondary)
+    return f"{primary_label} only" if regime == "primary_only" else f"{primary_label}+{secondary_label}"
+
+
 def _plot_learning(summary_df: pd.DataFrame, out_dir: str, suffix: str) -> None:
     os.makedirs(out_dir, exist_ok=True)
+    axis_label_fontsize = 16
+    tick_label_fontsize = 14
+    legend_fontsize = 14
 
     def _plot(metric: str, ylabel: str, fname: str) -> None:
         fig, ax = plt.subplots(figsize=(9, 5))
@@ -254,7 +270,7 @@ def _plot_learning(summary_df: pd.DataFrame, out_dir: str, suffix: str) -> None:
                 y = g["acc_mean"].to_numpy(float)
                 yerr = g["acc_sem"].to_numpy(float)
 
-            label = f"{primary} only" if regime == "primary_only" else f"{primary}+{secondary}"
+            label = _learning_regime_label(primary, secondary, regime)
             linestyle = "-" if regime == "primary_only" else "--"
             ax.errorbar(
                 g["train_size"].to_numpy(int),
@@ -266,10 +282,12 @@ def _plot_learning(summary_df: pd.DataFrame, out_dir: str, suffix: str) -> None:
                 label=label,
             )
 
-        ax.set_xlabel("Primary training set size (patients)")
-        ax.set_ylabel(ylabel)
+        ax.set_xlabel("Primary training set size (patients)", fontsize=axis_label_fontsize)
+        ax.set_ylabel(ylabel, fontsize=axis_label_fontsize)
+        ax.tick_params(axis="both", labelsize=tick_label_fontsize)
+        ax.set_ylim(0.5, 1.0)
         ax.grid(True, alpha=0.3)
-        ax.legend(loc="best")
+        ax.legend(loc="best", fontsize=legend_fontsize, title_fontsize=legend_fontsize)
         fig.tight_layout()
         out_path = os.path.join(out_dir, fname)
         fig.savefig(out_path, dpi=200)
@@ -293,6 +311,10 @@ def run_learning_curve_one_direction_fixed(
     out_dir: str,
     run_classification_cv_fn: Callable,
     prefix_ids_fn: Callable,
+    fit_feature_alignment_fn: Optional[Callable] = None,
+    apply_feature_alignment_fn: Optional[Callable] = None,
+    feature_alignment_method: Optional[str] = None,
+    feature_alignment_kwargs: Optional[dict] = None,
     seed: int = 42,
     n_jobs: Optional[int] = None,
 ) -> pd.DataFrame:
@@ -305,16 +327,47 @@ def run_learning_curve_one_direction_fixed(
     if n_jobs < 1:
         raise ValueError(f"n_jobs must be >= 1 (or -1). Got: {n_jobs}")
 
+    alignment_enabled = fit_feature_alignment_fn is not None
+    if alignment_enabled != (apply_feature_alignment_fn is not None):
+        raise ValueError("Learning-curve feature alignment requires both fit and apply hooks.")
+    if alignment_enabled and feature_alignment_method not in {"meanstd", "median_iqr"}:
+        raise ValueError(
+            "Learning-curve feature alignment currently supports only 'meanstd' and 'median_iqr'."
+        )
+
     secondary_train_pref = prefix_ids_fn(secondary_train, prefix=f"{secondary_name}_")
+    feat_cols = get_feature_columns(primary_train)
+    feature_alignment_kwargs = dict(feature_alignment_kwargs or {})
+
+    primary_train_for_tuning = primary_train
+
+    if alignment_enabled:
+        alignment_full = fit_feature_alignment_fn(
+            primary_train,
+            secondary_train,
+            feat_cols,
+            method=feature_alignment_method,
+            **feature_alignment_kwargs,
+        )
+        primary_train_for_tuning = apply_feature_alignment_fn(
+            primary_train,
+            feat_cols,
+            alignment_full,
+            method=feature_alignment_method,
+        )
+        print(
+            f"[LEARNING-fixed] Using primary-side feature alignment for {primary_name} -> {secondary_name} "
+            f"(method={feature_alignment_method})."
+        )
 
     print(f"\n[LEARNING-fixed] Tuning primary-only model for {primary_name}...")
     _, _, _, _, _, model_p, pipe_primary, params_p = run_classification_cv_fn(
-        primary_train, n_folds=tune_folds, hyperparameter_tuning=hyperparameter_tuning, return_model=True
+        primary_train_for_tuning, n_folds=tune_folds, hyperparameter_tuning=hyperparameter_tuning, return_model=True
     )
     print(f"[LEARNING-fixed] {primary_name} primary-only selected: {model_p} params={params_p}")
 
     print(f"\n[LEARNING-fixed] Tuning mixed model for {primary_name}+{secondary_name}...")
-    mixed_full = pd.concat([primary_train, secondary_train_pref], ignore_index=True, sort=False)
+    mixed_full = pd.concat([primary_train_for_tuning, secondary_train_pref], ignore_index=True, sort=False)
     _, _, _, _, _, model_m, pipe_mixed, params_m = run_classification_cv_fn(
         mixed_full, n_folds=tune_folds, hyperparameter_tuning=hyperparameter_tuning, return_model=True
     )
@@ -324,6 +377,28 @@ def run_learning_curve_one_direction_fixed(
     for n in train_sizes:
         for r in range(n_repeats):
             df_sub = stratified_subsample(primary_train, n=n, seed=seed + 1000 * n + r)
+            if alignment_enabled:
+                alignment_sub = fit_feature_alignment_fn(
+                    df_sub,
+                    secondary_train,
+                    feat_cols,
+                    method=feature_alignment_method,
+                    **feature_alignment_kwargs,
+                )
+                df_sub = apply_feature_alignment_fn(
+                    df_sub,
+                    feat_cols,
+                    alignment_sub,
+                    method=feature_alignment_method,
+                )
+                primary_test_sub = apply_feature_alignment_fn(
+                    primary_test,
+                    feat_cols,
+                    alignment_sub,
+                    method=feature_alignment_method,
+                )
+            else:
+                primary_test_sub = primary_test
             tasks.append(
                 dict(
                     primary_name=primary_name,
@@ -331,7 +406,7 @@ def run_learning_curve_one_direction_fixed(
                     train_size=int(n),
                     repeat=int(r),
                     df_sub=df_sub,
-                    primary_test=primary_test,
+                    primary_test=primary_test_sub,
                     secondary_train_pref=secondary_train_pref,
                     pipe_primary=pipe_primary,
                     pipe_mixed=pipe_mixed,
@@ -387,6 +462,10 @@ def run_learning_curve_one_direction_cv(
     out_dir: str,
     run_classification_cv_fn: Callable,
     prefix_ids_fn: Callable,
+    fit_feature_alignment_fn: Optional[Callable] = None,
+    apply_feature_alignment_fn: Optional[Callable] = None,
+    feature_alignment_method: Optional[str] = None,
+    feature_alignment_kwargs: Optional[dict] = None,
     seed: int = 42,
     n_jobs: Optional[int] = None,
 ) -> pd.DataFrame:
@@ -399,16 +478,47 @@ def run_learning_curve_one_direction_cv(
     if n_jobs < 1:
         raise ValueError(f"n_jobs must be >= 1 (or -1). Got: {n_jobs}")
 
+    alignment_enabled = fit_feature_alignment_fn is not None
+    if alignment_enabled != (apply_feature_alignment_fn is not None):
+        raise ValueError("Learning-curve feature alignment requires both fit and apply hooks.")
+    if alignment_enabled and feature_alignment_method not in {"meanstd", "median_iqr"}:
+        raise ValueError(
+            "Learning-curve feature alignment currently supports only 'meanstd' and 'median_iqr'."
+        )
+
     secondary_train_pref = prefix_ids_fn(secondary_train_pool, prefix=f"{secondary_name}_")
+    feat_cols = get_feature_columns(primary_train_pool)
+    feature_alignment_kwargs = dict(feature_alignment_kwargs or {})
+
+    primary_train_pool_for_tuning = primary_train_pool
+
+    if alignment_enabled:
+        alignment_full = fit_feature_alignment_fn(
+            primary_train_pool,
+            secondary_train_pool,
+            feat_cols,
+            method=feature_alignment_method,
+            **feature_alignment_kwargs,
+        )
+        primary_train_pool_for_tuning = apply_feature_alignment_fn(
+            primary_train_pool,
+            feat_cols,
+            alignment_full,
+            method=feature_alignment_method,
+        )
+        print(
+            f"[LEARNING-cv] Using primary-side feature alignment for {primary_name} -> {secondary_name} "
+            f"(method={feature_alignment_method})."
+        )
 
     print(f"\n[LEARNING-cv] Tuning primary-only model for {primary_name} (on full primary train pool)...")
     _, _, _, _, _, model_p, pipe_primary, params_p = run_classification_cv_fn(
-        primary_train_pool, n_folds=tune_folds, hyperparameter_tuning=hyperparameter_tuning, return_model=True
+        primary_train_pool_for_tuning, n_folds=tune_folds, hyperparameter_tuning=hyperparameter_tuning, return_model=True
     )
     print(f"[LEARNING-cv] {primary_name} primary-only selected: {model_p} params={params_p}")
 
     print(f"\n[LEARNING-cv] Tuning mixed model for {primary_name}+{secondary_name} (on full combined train)...")
-    mixed_full = pd.concat([primary_train_pool, secondary_train_pref], ignore_index=True, sort=False)
+    mixed_full = pd.concat([primary_train_pool_for_tuning, secondary_train_pref], ignore_index=True, sort=False)
     _, _, _, _, _, model_m, pipe_mixed, params_m = run_classification_cv_fn(
         mixed_full, n_folds=tune_folds, hyperparameter_tuning=hyperparameter_tuning, return_model=True
     )
@@ -430,6 +540,28 @@ def run_learning_curve_one_direction_cv(
                 continue
             for r in range(n_repeats):
                 df_sub = stratified_subsample(df_fold_train, n=n, seed=seed + 100000 * fold_idx + 1000 * n + r)
+                if alignment_enabled:
+                    alignment_sub = fit_feature_alignment_fn(
+                        df_sub,
+                        secondary_train_pool,
+                        feat_cols,
+                        method=feature_alignment_method,
+                        **feature_alignment_kwargs,
+                    )
+                    df_sub = apply_feature_alignment_fn(
+                        df_sub,
+                        feat_cols,
+                        alignment_sub,
+                        method=feature_alignment_method,
+                    )
+                    df_fold_val_sub = apply_feature_alignment_fn(
+                        df_fold_val,
+                        feat_cols,
+                        alignment_sub,
+                        method=feature_alignment_method,
+                    )
+                else:
+                    df_fold_val_sub = df_fold_val
                 tasks.append(
                     dict(
                         primary_name=primary_name,
@@ -438,7 +570,7 @@ def run_learning_curve_one_direction_cv(
                         train_size=int(n),
                         repeat=int(r),
                         df_sub=df_sub,
-                        df_fold_val=df_fold_val,
+                        df_fold_val=df_fold_val_sub,
                         secondary_train_pref=secondary_train_pref,
                         pipe_primary=pipe_primary,
                         pipe_mixed=pipe_mixed,
@@ -496,6 +628,10 @@ def run_learning_curve_analysis(
     eval_mode: str,
     run_classification_cv_fn: Callable,
     prefix_ids_fn: Callable,
+    fit_feature_alignment_fn: Optional[Callable] = None,
+    apply_feature_alignment_fn: Optional[Callable] = None,
+    feature_alignment_method: Optional[str] = None,
+    feature_alignment_kwargs: Optional[dict] = None,
     n_jobs: Optional[int] = None,
 ) -> None:
     if eval_mode not in {"fixed", "cv"}:
@@ -515,6 +651,10 @@ def run_learning_curve_analysis(
             out_dir=out_dir,
             run_classification_cv_fn=run_classification_cv_fn,
             prefix_ids_fn=prefix_ids_fn,
+            fit_feature_alignment_fn=fit_feature_alignment_fn,
+            apply_feature_alignment_fn=apply_feature_alignment_fn,
+            feature_alignment_method=feature_alignment_method,
+            feature_alignment_kwargs=feature_alignment_kwargs,
             n_jobs=n_jobs,
         )
         raw_e = run_learning_curve_one_direction_fixed(
@@ -530,6 +670,10 @@ def run_learning_curve_analysis(
             out_dir=out_dir,
             run_classification_cv_fn=run_classification_cv_fn,
             prefix_ids_fn=prefix_ids_fn,
+            fit_feature_alignment_fn=fit_feature_alignment_fn,
+            apply_feature_alignment_fn=apply_feature_alignment_fn,
+            feature_alignment_method=feature_alignment_method,
+            feature_alignment_kwargs=feature_alignment_kwargs,
             n_jobs=n_jobs,
         )
         all_raw = [raw_i, raw_e]
@@ -547,6 +691,10 @@ def run_learning_curve_analysis(
             out_dir=out_dir,
             run_classification_cv_fn=run_classification_cv_fn,
             prefix_ids_fn=prefix_ids_fn,
+            fit_feature_alignment_fn=fit_feature_alignment_fn,
+            apply_feature_alignment_fn=apply_feature_alignment_fn,
+            feature_alignment_method=feature_alignment_method,
+            feature_alignment_kwargs=feature_alignment_kwargs,
             n_jobs=n_jobs,
         )
         raw_e = run_learning_curve_one_direction_cv(
@@ -562,6 +710,10 @@ def run_learning_curve_analysis(
             out_dir=out_dir,
             run_classification_cv_fn=run_classification_cv_fn,
             prefix_ids_fn=prefix_ids_fn,
+            fit_feature_alignment_fn=fit_feature_alignment_fn,
+            apply_feature_alignment_fn=apply_feature_alignment_fn,
+            feature_alignment_method=feature_alignment_method,
+            feature_alignment_kwargs=feature_alignment_kwargs,
             n_jobs=n_jobs,
         )
         all_raw = [raw_i, raw_e]

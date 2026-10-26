@@ -50,26 +50,24 @@ def _sort_patient_rows(df: pd.DataFrame) -> pd.DataFrame:
 
 def _get_spatial_metric_functions():
     # Import lazily so orchestration code can be imported without immediately
-    # pulling in squidpy/datashader-dependent metric backends.
-    from spatial_metrics import (
-        calculate_bidirectional_min_distance,
-        calculate_centrality_scores,
-        calculate_cluster_cooccurrence_ratio,
-        calculate_neighborhood_enrichment_test,
-        calculate_newmans_assortativity,
-        calculate_objectobject_correlation,
-        calculate_ripley_l,
-    )
+    # pulling in metric dependencies.
+    from spatial_metrics import calculate_behanova_spatial_metrics
 
-    return {
-        "calculate_bidirectional_min_distance": calculate_bidirectional_min_distance,
-        "calculate_centrality_scores": calculate_centrality_scores,
-        "calculate_cluster_cooccurrence_ratio": calculate_cluster_cooccurrence_ratio,
-        "calculate_neighborhood_enrichment_test": calculate_neighborhood_enrichment_test,
-        "calculate_newmans_assortativity": calculate_newmans_assortativity,
-        "calculate_objectobject_correlation": calculate_objectobject_correlation,
-        "calculate_ripley_l": calculate_ripley_l,
-    }
+    return {"calculate_behanova_spatial_metrics": calculate_behanova_spatial_metrics}
+
+
+def _get_expected_spatial_feature_columns() -> List[str]:
+    from spatial_metrics import BEHANOVA_FEATURE_COLUMNS
+
+    return list(BEHANOVA_FEATURE_COLUMNS)
+
+
+def _restrict_to_expected_metric_columns(metrics_df: pd.DataFrame) -> pd.DataFrame:
+    if metrics_df is None or metrics_df.empty:
+        return metrics_df
+    meta_cols = [col for col in ["ID", "sample_name", "label", "cell_count", "cancer_count", "stroma_count"] if col in metrics_df.columns]
+    feature_cols = [col for col in _get_expected_spatial_feature_columns() if col in metrics_df.columns]
+    return metrics_df[meta_cols + feature_cols].copy()
 
 
 @dataclass(frozen=True)
@@ -88,8 +86,8 @@ class InternalPaths:
     #inform_cells_path: str = "data/interim/BOMI2_all_cells_TIL__matchedBOMI1_separate_3d.csv"
     #inform_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples__inform_matchedBOMI1_separate_3d.csv"
 
-
-    
+    cellpose_cells_path: str = "data/interim/cellpose_extracted_cells_fitlered_necrosis.csv"
+    cellpose_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples.csv"
     #cellpose_cells_path: str = "data/interim/cellpose_extracted_cells_fitlered_necrosis__matchedBOMI1.csv"
     #cellpose_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples__cellpose_matchedBOMI1.csv"
     #cellpose_cells_path: str = "data/interim/cellpose_extracted_cells_fitlered_necrosis__matchedBOMI1_separate.csv"
@@ -98,23 +96,17 @@ class InternalPaths:
     #cellpose_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples__cellpose_matchedBOMI1_separate_3d.csv"
     #cellpose_cells_path: str = "data/interim/cellpose_extracted_cells_fitlered_necrosis__matchedBOMI1_separate_2d.csv"
     #cellpose_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples__cellpose_matchedBOMI1_separate_2d.csv"
-    
     #cellpose_cells_path: str = "cellpose_extracted_cells_fitlered_necrosis__matchedstromaBOMI1.csv"
     #cellpose_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples__cellpose_matchedBOMI1stroma.csv"
-    cellpose_cells_path: str = "data/interim/cellpose_extracted_cells_fitlered_necrosis.csv"
-    cellpose_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples.csv"
-
     #cellpose_cells_path: str = "data/interim/cellpose_extracted_cells_fitlered_necrosis__matchedBOMI1_featurepanel_quick.csv"
     #cellpose_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples__cellpose_matchedBOMI1_featurepanel_quick.csv"
-
-
     
     cellprofiler_cells_path: str = "data/interim/cellprofiler_extracted_cells_filtered_necrosis.csv"
     cellprofiler_samples_path: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/samples.csv"
 
     internal_train_csv: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/binary_subtype_prediction_ACvsSqCC/static_split/train_val.csv"
     internal_test_csv: str = "../multiplex_dataset/lung_cancer_BOMI2_dataset/binary_subtype_prediction_ACvsSqCC/static_split/test.csv"
-
+    
 
 @dataclass(frozen=True)
 class ExternalPaths:
@@ -138,16 +130,7 @@ def calculate_spatial_metrics_for_sample(cells_df: pd.DataFrame) -> Optional[Dic
     metrics["cell_count"] = int(len(cells_df))
     metrics["cancer_count"] = int((cell_types == 1).sum())
     metrics["stroma_count"] = int((cell_types == 0).sum())
-
-    metrics.update(metric_fns["calculate_ripley_l"](coords, cell_types))
-    metrics.update(metric_fns["calculate_bidirectional_min_distance"](coords, cell_types))
-    metrics["newmans_assortativity"] = float(
-        metric_fns["calculate_newmans_assortativity"](coords, cell_types, radius=50)
-    )
-    metrics.update(metric_fns["calculate_centrality_scores"](coords, cell_types))
-    metrics.update(metric_fns["calculate_cluster_cooccurrence_ratio"](coords, cell_types))
-    metrics.update(metric_fns["calculate_neighborhood_enrichment_test"](coords, cell_types))
-    metrics.update(metric_fns["calculate_objectobject_correlation"](coords, cell_types))
+    metrics.update(metric_fns["calculate_behanova_spatial_metrics"](coords, cell_types))
     return metrics
 
 
@@ -261,7 +244,7 @@ def get_or_compute_metrics(
     recompute: bool = False,
     n_jobs: Optional[int] = None,
 ) -> pd.DataFrame:
-    if recompute or (not os.path.exists(metrics_cache_path)):
+    def _compute_and_save() -> pd.DataFrame:
         print(f"[INFO] Computing metrics for {cohort_name} -> {metrics_cache_path}")
         m = compute_metrics_for_cohort(patients_df, samples_df, cells_df, n_jobs=n_jobs)
         if m is None or m.empty:
@@ -274,6 +257,10 @@ def get_or_compute_metrics(
             os.makedirs(metrics_cache_dir, exist_ok=True)
         m.to_csv(metrics_cache_path, index=False)
         print(f"[INFO] Saved metrics: {metrics_cache_path}")
+        return m
+
+    if recompute or (not os.path.exists(metrics_cache_path)):
+        m = _compute_and_save()
     else:
         if os.path.getsize(metrics_cache_path) < 10:
             raise RuntimeError(
@@ -282,9 +269,18 @@ def get_or_compute_metrics(
             )
         print(f"[INFO] Loading cached metrics for {cohort_name}: {metrics_cache_path}")
         m = pd.read_csv(metrics_cache_path)
+        expected_cols = _get_expected_spatial_feature_columns()
+        missing = [col for col in expected_cols if col not in m.columns]
+        if missing:
+            print(
+                f"[INFO] Cached metrics for {cohort_name} are missing {len(missing)} "
+                "Behanova feature columns; recomputing."
+            )
+            m = _compute_and_save()
 
     m = _sort_metrics_rows(m)
-    return attach_counts_from_cells(m, cells_df)
+    m = attach_counts_from_cells(m, cells_df)
+    return _restrict_to_expected_metric_columns(m)
 
 
 def prepare_patient_level_tables(
@@ -319,8 +315,6 @@ def prepare_patient_level_tables(
     int_patient_df = aggregate_cores_to_patient(int_metrics_per_core)
     int_patient_df = _sort_patient_rows(int_patient_df)
     print(f"[INFO] INTERNAL patient rows after aggregation: {len(int_patient_df)}")
-    for col in ["cancer_ripley_L_0.0", "stroma_ripley_L_0.0"]:
-        int_patient_df.drop(columns=[col], errors="ignore", inplace=True)
     train_ids_int = set(int_patients_train["ID"].astype(str))
     test_ids_int = set(int_patients_test["ID"].astype(str))
     df_train_int = subset_by_ids(int_patient_df, train_ids_int)
@@ -347,8 +341,6 @@ def prepare_patient_level_tables(
     ext_metrics_per_core = filter_metrics_by_counts(ext_metrics_per_core, qc=qc, cohort_name="EXTERNAL/BOMI1")
     ext_patient_df = aggregate_cores_to_patient(ext_metrics_per_core)
     ext_patient_df = _sort_patient_rows(ext_patient_df)
-    for col in ["cancer_ripley_L_0.0", "stroma_ripley_L_0.0"]:
-        ext_patient_df.drop(columns=[col], errors="ignore", inplace=True)
     ext_train_ids = read_split_ids(ext_train_csv)
     ext_test_ids = read_split_ids(ext_test_csv)
     df_train_ext = subset_by_ids(ext_patient_df, ext_train_ids)

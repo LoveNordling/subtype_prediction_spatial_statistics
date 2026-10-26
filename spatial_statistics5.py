@@ -36,6 +36,7 @@ import os
 import time
 import random
 import argparse
+import json
 from typing import Dict, Optional, Tuple, List
 
 import numpy as np
@@ -72,14 +73,34 @@ from spatial_learning_curves import (
     parse_train_sizes,
     run_learning_curve_analysis,
 )
+from spatial_metrics import BEHANOVA_FEATURE_COLUMNS
 from spatial_utils import (
     CountQC,
     ensure_columns,
-    get_feature_columns,
+    get_feature_columns as _get_feature_columns,
 )
 
 
 RANDOM_STATE = 42
+
+MODEL_FEATURE_COLUMNS = list(BEHANOVA_FEATURE_COLUMNS)
+FEATURE_DIRECTION_POLICIES = ("none", "keep-consistent", "invert-discordant")
+
+
+def get_feature_columns(df: pd.DataFrame) -> List[str]:
+    """Return the locked manuscript feature panel when present.
+
+    This prevents stale cached aliases or exploratory numeric columns from
+    silently entering the model feature matrix.
+    """
+
+    present = [
+        col
+        for col in MODEL_FEATURE_COLUMNS
+        if col in df.columns and pd.api.types.is_numeric_dtype(df[col])
+    ]
+    return present if present else _get_feature_columns(df)
+
 
 def set_global_seed(seed: int = RANDOM_STATE) -> None:
     random.seed(seed)
@@ -290,6 +311,254 @@ def run_classification_cv(
         best_pipeline,
         best_params,
     )
+
+
+def _validated_stratified_splits(
+    y: np.ndarray,
+    requested_splits: int,
+    *,
+    label: str,
+    random_state: int,
+) -> Tuple[StratifiedKFold, int]:
+    """Return a StratifiedKFold that is feasible for the smallest class."""
+
+    requested_splits = int(requested_splits)
+    if requested_splits < 2:
+        raise ValueError(f"{label} must use at least 2 folds, got {requested_splits}")
+
+    counts = pd.Series(y).value_counts(dropna=False)
+    min_class_count = int(counts.min()) if not counts.empty else 0
+    if min_class_count < 2:
+        raise ValueError(
+            f"{label} requires at least 2 samples in each class; "
+            f"class counts were {counts.to_dict()}."
+        )
+
+    n_splits = min(requested_splits, min_class_count)
+    if n_splits < requested_splits:
+        print(
+            f"[WARN] Reducing {label} from {requested_splits} to {n_splits} folds "
+            f"because the smallest class has {min_class_count} samples."
+        )
+
+    return StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state), n_splits
+
+
+def run_nested_classification_cv(
+    train_df: pd.DataFrame,
+    *,
+    outer_folds: int = 5,
+    inner_folds: int = 3,
+    hyperparameter_tuning: bool = True,
+    use_feature_selection: bool = False,
+) -> Dict[str, object]:
+    """Estimate one classifier with nested CV for segmentation-method comparison.
+
+    The outer split is used only for evaluation. The inner split tunes a small
+    hyperparameter grid for a single fixed classifier family so the result is
+    fast enough to compare across segmentation pipelines.
+    """
+
+    if train_df is None or train_df.empty:
+        raise ValueError("train_df is empty")
+
+    feat_cols = get_feature_columns(train_df)
+    if not feat_cols:
+        raise ValueError("No feature columns found after dropping counts/IDs")
+
+    train_df = train_df.reset_index(drop=True).copy()
+    X = train_df[feat_cols].to_numpy(float)
+    y = train_df["label"].to_numpy(int)
+
+    outer_cv, outer_n_splits = _validated_stratified_splits(
+        y,
+        outer_folds,
+        label="nested outer CV",
+        random_state=RANDOM_STATE,
+    )
+
+    fold_rows: List[Dict[str, object]] = []
+    pred_rows: List[pd.DataFrame] = []
+
+    print(
+        f"[NESTED CV] Running {outer_n_splits} outer folds with "
+        f"{inner_folds} requested inner folds on {len(train_df)} patients."
+    )
+
+    for fold_idx, (tr_idx, te_idx) in enumerate(outer_cv.split(X, y), start=1):
+        print(f"[NESTED CV] Outer fold {fold_idx}/{outer_n_splits}...")
+
+        X_tr, X_te = X[tr_idx], X[te_idx]
+        y_tr, y_te = y[tr_idx], y[te_idx]
+
+        if hyperparameter_tuning:
+            inner_cv, inner_n_splits = _validated_stratified_splits(
+                y_tr,
+                inner_folds,
+                label=f"nested inner CV fold {fold_idx}",
+                random_state=RANDOM_STATE + fold_idx,
+            )
+            pipeline = _build_pipeline(
+                LogisticRegression(max_iter=5000, random_state=RANDOM_STATE, solver="liblinear"),
+                SelectFromModel(
+                    LogisticRegression(
+                        penalty="l1",
+                        solver="liblinear",
+                        C=1.0,
+                        random_state=RANDOM_STATE,
+                    )
+                )
+                if use_feature_selection
+                else None,
+            )
+            param_grid = {
+                "model__C": [0.1, 1.0, 10.0],
+                "model__penalty": ["l2"],
+                "model__solver": ["liblinear"],
+            }
+            search = GridSearchCV(
+                pipeline,
+                param_grid,
+                scoring="roc_auc",
+                cv=inner_cv,
+                n_jobs=1,
+            )
+            search.fit(X_tr, y_tr)
+            pipeline = search.best_estimator_
+            best_params = dict(search.best_params_)
+            model_name = "LogisticRegression"
+            inner_best_auc = float(search.best_score_)
+        else:
+            inner_n_splits = 0
+            model_name = "LogisticRegression (default)"
+            best_params = {"model__C": 1.0, "model__penalty": "l2", "model__solver": "liblinear"}
+            inner_best_auc = float("nan")
+            pipeline = _build_pipeline(
+                LogisticRegression(max_iter=5000, random_state=RANDOM_STATE, solver="liblinear"),
+                SelectFromModel(
+                    LogisticRegression(
+                        penalty="l1",
+                        solver="liblinear",
+                        C=1.0,
+                        random_state=RANDOM_STATE,
+                    )
+                )
+                if use_feature_selection
+                else None,
+            )
+
+        pipeline.fit(X_tr, y_tr)
+        y_prob = pipeline.predict_proba(X_te)[:, 1]
+        y_pred = pipeline.predict(X_te)
+
+        auc_fold = float(roc_auc_score(y_te, y_prob))
+        acc_fold = float(np.mean(y_pred == y_te))
+
+        print(
+            f"[NESTED CV] Fold {fold_idx}: {model_name}, "
+            f"inner AUC={inner_best_auc:.3f}, outer AUC={auc_fold:.3f}, Acc={acc_fold:.3f}"
+        )
+
+        fold_rows.append(
+            {
+                "fold": fold_idx,
+                "n_train": int(len(tr_idx)),
+                "n_eval": int(len(te_idx)),
+                "positive_train": int(np.sum(y_tr == 1)),
+                "positive_eval": int(np.sum(y_te == 1)),
+                "inner_folds": int(inner_n_splits),
+                "model_name": str(model_name),
+                "inner_best_auc": float(inner_best_auc) if np.isfinite(inner_best_auc) else np.nan,
+                "outer_auc": auc_fold,
+                "outer_accuracy": acc_fold,
+                "best_params_json": json.dumps(best_params, sort_keys=True),
+            }
+        )
+
+        pred_rows.append(
+            pd.DataFrame(
+                {
+                    "ID": train_df.iloc[te_idx]["ID"].astype(str).to_numpy(),
+                    "fold": fold_idx,
+                    "y_true": y_te,
+                    "y_prob": y_prob,
+                    "y_pred": y_pred,
+                    "model_name": str(model_name),
+                }
+            )
+        )
+
+    fold_metrics = pd.DataFrame(fold_rows)
+    predictions = pd.concat(pred_rows, ignore_index=True) if pred_rows else pd.DataFrame()
+    aucs = fold_metrics["outer_auc"].astype(float).tolist()
+    accs = fold_metrics["outer_accuracy"].astype(float).tolist()
+
+    return {
+        "outer_folds": int(outer_n_splits),
+        "requested_outer_folds": int(outer_folds),
+        "requested_inner_folds": int(inner_folds),
+        "auc_mean": float(np.nanmean(aucs)),
+        "auc_std": float(np.nanstd(aucs)),
+        "auc_sem": 0.0 if len(aucs) <= 1 else float(_sem(aucs)),
+        "accuracy_mean": float(np.nanmean(accs)),
+        "accuracy_std": float(np.nanstd(accs)),
+        "accuracy_sem": 0.0 if len(accs) <= 1 else float(_sem(accs)),
+        "fold_metrics": fold_metrics,
+        "predictions": predictions,
+        "feature_columns": feat_cols,
+    }
+
+
+def save_nested_cv_outputs(
+    nested_cv: Dict[str, object],
+    *,
+    cohort: str,
+    out_dir: str,
+) -> Dict[str, str]:
+    os.makedirs(out_dir, exist_ok=True)
+
+    stem = f"{cohort.lower()}_nested_cv"
+    fold_metrics_path = os.path.join(out_dir, f"{stem}__fold_metrics.csv")
+    predictions_path = os.path.join(out_dir, f"{stem}__predictions.csv")
+    summary_path = os.path.join(out_dir, f"{stem}__summary.csv")
+
+    fold_metrics = nested_cv["fold_metrics"]
+    predictions = nested_cv["predictions"]
+    if not isinstance(fold_metrics, pd.DataFrame) or not isinstance(predictions, pd.DataFrame):
+        raise TypeError("nested_cv must contain DataFrame values for fold_metrics and predictions")
+
+    fold_metrics.to_csv(fold_metrics_path, index=False)
+    predictions.to_csv(predictions_path, index=False)
+
+    summary = pd.DataFrame(
+        [
+            {
+                "cohort": cohort,
+                "outer_folds": nested_cv["outer_folds"],
+                "requested_outer_folds": nested_cv["requested_outer_folds"],
+                "requested_inner_folds": nested_cv["requested_inner_folds"],
+                "auc_mean": nested_cv["auc_mean"],
+                "auc_std": nested_cv["auc_std"],
+                "auc_sem": nested_cv["auc_sem"],
+                "accuracy_mean": nested_cv["accuracy_mean"],
+                "accuracy_std": nested_cv["accuracy_std"],
+                "accuracy_sem": nested_cv["accuracy_sem"],
+                "n_patients": int(len(predictions)),
+                "n_features": int(len(nested_cv["feature_columns"])),
+                "feature_columns": json.dumps(nested_cv["feature_columns"]),
+            }
+        ]
+    )
+    summary.to_csv(summary_path, index=False)
+
+    print(f"[NESTED CV] Saved fold metrics to {fold_metrics_path}")
+    print(f"[NESTED CV] Saved out-of-fold predictions to {predictions_path}")
+    print(f"[NESTED CV] Saved summary to {summary_path}")
+    return {
+        "fold_metrics": fold_metrics_path,
+        "predictions": predictions_path,
+        "summary": summary_path,
+    }
 
 
 
@@ -589,7 +858,7 @@ def apply_feature_alignment_meanstd(
     return out
 
 
-def fit_feature_alignment_robust_iqr(
+def fit_feature_alignment_median_iqr(
     source_train: pd.DataFrame,
     target_train: pd.DataFrame,
     feat_cols: List[str],
@@ -613,7 +882,7 @@ def fit_feature_alignment_robust_iqr(
     }
 
 
-def apply_feature_alignment_robust_iqr(
+def apply_feature_alignment_median_iqr(
     df: pd.DataFrame,
     feat_cols: List[str],
     alignment: Dict[str, np.ndarray],
@@ -625,175 +894,16 @@ def apply_feature_alignment_robust_iqr(
     return out
 
 
-def fit_feature_alignment_quantile(
-    source_train: pd.DataFrame,
-    target_train: pd.DataFrame,
-    feat_cols: List[str],
-    *,
-    n_quantiles: int = 201,
-) -> Dict[str, np.ndarray]:
-    src = source_train[feat_cols].to_numpy(float)
-    tgt = target_train[feat_cols].to_numpy(float)
-
-    src_fill = np.nanmedian(src, axis=0)
-    tgt_fill = np.nanmedian(tgt, axis=0)
-    src = np.where(np.isfinite(src), src, src_fill)
-    tgt = np.where(np.isfinite(tgt), tgt, tgt_fill)
-
-    n_quantiles = max(int(n_quantiles), 3)
-    quantile_levels = np.linspace(0.0, 1.0, n_quantiles)
-    source_quantiles = np.quantile(src, quantile_levels, axis=0)
-    target_quantiles = np.quantile(tgt, quantile_levels, axis=0)
-
-    return {
-        "source_quantiles": source_quantiles,
-        "target_quantiles": target_quantiles,
-        "source_fill": src_fill,
-    }
-
-
-def _interp_strict_monotone(x: np.ndarray, xp: np.ndarray, fp: np.ndarray) -> np.ndarray:
-    xp = np.asarray(xp, dtype=float)
-    fp = np.asarray(fp, dtype=float)
-    keep = np.ones(len(xp), dtype=bool)
-    keep[1:] = xp[1:] > xp[:-1]
-    xp = xp[keep]
-    fp = fp[keep]
-    if xp.size == 0:
-        return np.full_like(x, np.nan, dtype=float)
-    if xp.size == 1:
-        return np.full_like(x, fp[0], dtype=float)
-    return np.interp(x, xp, fp, left=fp[0], right=fp[-1])
-
-
-def apply_feature_alignment_quantile(
-    df: pd.DataFrame,
-    feat_cols: List[str],
-    alignment: Dict[str, np.ndarray],
-) -> pd.DataFrame:
-    out = df.copy()
-    vals = out[feat_cols].to_numpy(float)
-    vals = np.where(np.isfinite(vals), vals, alignment["source_fill"])
-
-    aligned = np.empty_like(vals, dtype=float)
-    quantile_levels = np.linspace(0.0, 1.0, alignment["source_quantiles"].shape[0])
-    for idx in range(len(feat_cols)):
-        src_q = alignment["source_quantiles"][:, idx]
-        tgt_q = alignment["target_quantiles"][:, idx]
-        percentiles = _interp_strict_monotone(vals[:, idx], src_q, quantile_levels)
-        aligned[:, idx] = np.interp(percentiles, quantile_levels, tgt_q, left=tgt_q[0], right=tgt_q[-1])
-
-    out.loc[:, feat_cols] = aligned
-    return out
-
-
-def _matrix_square_root_symmetric(
-    matrix: np.ndarray,
-    *,
-    inverse: bool = False,
-    eig_floor: float = 1e-6,
-) -> np.ndarray:
-    evals, evecs = np.linalg.eigh(matrix)
-    evals = np.where(np.isfinite(evals), evals, 0.0)
-    max_eval = float(np.max(evals)) if evals.size else 0.0
-    min_eval = max(max_eval * eig_floor, eig_floor)
-    evals = np.maximum(evals, min_eval)
-    if inverse:
-        scaled = 1.0 / np.sqrt(evals)
-    else:
-        scaled = np.sqrt(evals)
-    return evecs @ np.diag(scaled) @ evecs.T
-
-
-def _regularize_covariance(cov: np.ndarray, shrinkage: float) -> np.ndarray:
-    n_features = cov.shape[0]
-    trace_scale = float(np.trace(cov)) / n_features if n_features else 1.0
-    if not np.isfinite(trace_scale) or trace_scale <= 0:
-        trace_scale = 1.0
-    identity = np.eye(n_features, dtype=float) * trace_scale
-    shrinkage = float(np.clip(shrinkage, 0.0, 1.0))
-    return ((1.0 - shrinkage) * cov) + (shrinkage * identity)
-
-
-def fit_feature_alignment_coral(
-    source_train: pd.DataFrame,
-    target_train: pd.DataFrame,
-    feat_cols: List[str],
-    *,
-    shrinkage: float = 0.1,
-    eig_floor: float = 1e-6,
-) -> Dict[str, np.ndarray]:
-    src = source_train[feat_cols].to_numpy(float)
-    tgt = target_train[feat_cols].to_numpy(float)
-
-    src_mean = np.nanmean(src, axis=0)
-    tgt_mean = np.nanmean(tgt, axis=0)
-
-    src = np.where(np.isfinite(src), src, src_mean)
-    tgt = np.where(np.isfinite(tgt), tgt, tgt_mean)
-    src_centered = src - src_mean
-    tgt_centered = tgt - tgt_mean
-
-    src_cov = np.cov(src_centered, rowvar=False)
-    tgt_cov = np.cov(tgt_centered, rowvar=False)
-    src_cov = np.atleast_2d(np.asarray(src_cov, dtype=float))
-    tgt_cov = np.atleast_2d(np.asarray(tgt_cov, dtype=float))
-
-    src_cov_reg = _regularize_covariance(src_cov, shrinkage=shrinkage)
-    tgt_cov_reg = _regularize_covariance(tgt_cov, shrinkage=shrinkage)
-
-    source_inv_sqrt = _matrix_square_root_symmetric(src_cov_reg, inverse=True, eig_floor=eig_floor)
-    target_sqrt = _matrix_square_root_symmetric(tgt_cov_reg, inverse=False, eig_floor=eig_floor)
-    transform = source_inv_sqrt @ target_sqrt
-
-    return {
-        "source_mean": src_mean,
-        "target_mean": tgt_mean,
-        "transform": transform,
-    }
-
-
-def apply_feature_alignment_coral(
-    df: pd.DataFrame,
-    feat_cols: List[str],
-    alignment: Dict[str, np.ndarray],
-) -> pd.DataFrame:
-    out = df.copy()
-    vals = out[feat_cols].to_numpy(float)
-    vals = np.where(np.isfinite(vals), vals, alignment["source_mean"])
-    vals = (vals - alignment["source_mean"]) @ alignment["transform"] + alignment["target_mean"]
-    out.loc[:, feat_cols] = vals
-    return out
-
-
 def fit_feature_alignment(
     source_train: pd.DataFrame,
     target_train: pd.DataFrame,
     feat_cols: List[str],
     method: str,
-    coral_shrinkage: float = 0.1,
-    coral_eig_floor: float = 1e-6,
-    quantile_n_quantiles: int = 201,
 ) -> Dict[str, np.ndarray]:
     if method == "meanstd":
         return fit_feature_alignment_meanstd(source_train, target_train, feat_cols)
-    if method == "robust_iqr":
-        return fit_feature_alignment_robust_iqr(source_train, target_train, feat_cols)
-    if method == "quantile":
-        return fit_feature_alignment_quantile(
-            source_train,
-            target_train,
-            feat_cols,
-            n_quantiles=quantile_n_quantiles,
-        )
-    if method == "coral":
-        return fit_feature_alignment_coral(
-            source_train,
-            target_train,
-            feat_cols,
-            shrinkage=coral_shrinkage,
-            eig_floor=coral_eig_floor,
-        )
+    if method == "median_iqr":
+        return fit_feature_alignment_median_iqr(source_train, target_train, feat_cols)
     raise ValueError(f"Unknown feature alignment method: {method}")
 
 
@@ -805,13 +915,155 @@ def apply_feature_alignment(
 ) -> pd.DataFrame:
     if method == "meanstd":
         return apply_feature_alignment_meanstd(df, feat_cols, alignment)
-    if method == "robust_iqr":
-        return apply_feature_alignment_robust_iqr(df, feat_cols, alignment)
-    if method == "quantile":
-        return apply_feature_alignment_quantile(df, feat_cols, alignment)
-    if method == "coral":
-        return apply_feature_alignment_coral(df, feat_cols, alignment)
+    if method == "median_iqr":
+        return apply_feature_alignment_median_iqr(df, feat_cols, alignment)
     raise ValueError(f"Unknown feature alignment method: {method}")
+
+
+def _safe_feature_direction(values: pd.Series, labels: pd.Series) -> Dict[str, float]:
+    work = pd.DataFrame({"value": values, "label": labels}).copy()
+    work["value"] = pd.to_numeric(work["value"], errors="coerce")
+    work["label"] = pd.to_numeric(work["label"], errors="coerce")
+    work = work.dropna(subset=["value", "label"])
+    work = work[work["label"].isin([0, 1])]
+
+    label0 = work.loc[work["label"] == 0, "value"].to_numpy(float)
+    label1 = work.loc[work["label"] == 1, "value"].to_numpy(float)
+    mean0 = float(np.mean(label0)) if label0.size else np.nan
+    mean1 = float(np.mean(label1)) if label1.size else np.nan
+    delta = mean1 - mean0 if np.isfinite(mean0) and np.isfinite(mean1) else np.nan
+
+    if np.isfinite(delta) and delta > 0:
+        sign = 1.0
+    elif np.isfinite(delta) and delta < 0:
+        sign = -1.0
+    elif np.isfinite(delta):
+        sign = 0.0
+    else:
+        sign = np.nan
+
+    auc = np.nan
+    if label0.size > 0 and label1.size > 0 and work["value"].nunique(dropna=True) > 1:
+        try:
+            auc = float(roc_auc_score(work["label"].to_numpy(int), work["value"].to_numpy(float)))
+        except ValueError:
+            auc = np.nan
+
+    return {
+        "n_lusc": int(label0.size),
+        "n_luad": int(label1.size),
+        "mean_lusc": mean0,
+        "mean_luad": mean1,
+        "delta_luad_minus_lusc": delta,
+        "direction_sign": sign,
+        "auc_luad_raw_feature": auc,
+        "signed_auc_delta": auc - 0.5 if np.isfinite(auc) else np.nan,
+    }
+
+
+def build_feature_direction_consistency_report(
+    df_train_int: pd.DataFrame,
+    df_train_ext: pd.DataFrame,
+    feat_cols: List[str],
+) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    for feat in feat_cols:
+        if feat not in df_train_int.columns or feat not in df_train_ext.columns:
+            continue
+        int_stats = _safe_feature_direction(df_train_int[feat], df_train_int["label"])
+        ext_stats = _safe_feature_direction(df_train_ext[feat], df_train_ext["label"])
+
+        int_sign = int_stats["direction_sign"]
+        ext_sign = ext_stats["direction_sign"]
+        comparable = np.isfinite(int_sign) and np.isfinite(ext_sign) and int_sign != 0 and ext_sign != 0
+        direction_match = bool(comparable and int_sign == ext_sign)
+        discordant = bool(comparable and int_sign != ext_sign)
+
+        rows.append(
+            {
+                "feature": feat,
+                "internal_n_lusc": int_stats["n_lusc"],
+                "internal_n_luad": int_stats["n_luad"],
+                "internal_mean_lusc": int_stats["mean_lusc"],
+                "internal_mean_luad": int_stats["mean_luad"],
+                "internal_delta_luad_minus_lusc": int_stats["delta_luad_minus_lusc"],
+                "internal_direction_sign": int_sign,
+                "internal_auc_luad_raw_feature": int_stats["auc_luad_raw_feature"],
+                "internal_signed_auc_delta": int_stats["signed_auc_delta"],
+                "external_n_lusc": ext_stats["n_lusc"],
+                "external_n_luad": ext_stats["n_luad"],
+                "external_mean_lusc": ext_stats["mean_lusc"],
+                "external_mean_luad": ext_stats["mean_luad"],
+                "external_delta_luad_minus_lusc": ext_stats["delta_luad_minus_lusc"],
+                "external_direction_sign": ext_sign,
+                "external_auc_luad_raw_feature": ext_stats["auc_luad_raw_feature"],
+                "external_signed_auc_delta": ext_stats["signed_auc_delta"],
+                "direction_match": direction_match,
+                "discordant": discordant,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def apply_feature_direction_policy(
+    df_train_int: pd.DataFrame,
+    df_test_int: pd.DataFrame,
+    df_train_ext: pd.DataFrame,
+    df_test_ext: pd.DataFrame,
+    policy: str,
+    *,
+    invert_cohort: str = "internal",
+    out_dir: str = os.path.join("outputs", "metrics"),
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if policy not in FEATURE_DIRECTION_POLICIES:
+        raise ValueError(f"Unknown feature direction policy: {policy}")
+    if invert_cohort not in {"internal", "external"}:
+        raise ValueError(f"invert_cohort must be 'internal' or 'external', got {invert_cohort!r}")
+
+    feat_cols = get_feature_columns(pd.concat([df_train_int, df_train_ext], ignore_index=True, sort=False))
+    report = build_feature_direction_consistency_report(df_train_int, df_train_ext, feat_cols)
+    if report.empty:
+        return df_train_int, df_test_int, df_train_ext, df_test_ext, report
+
+    report["policy"] = policy
+    report["invert_cohort"] = invert_cohort if policy == "invert-discordant" else ""
+    report["action"] = "keep"
+
+    out_train_int = df_train_int.copy()
+    out_test_int = df_test_int.copy()
+    out_train_ext = df_train_ext.copy()
+    out_test_ext = df_test_ext.copy()
+
+    discordant_features = report.loc[report["discordant"], "feature"].astype(str).tolist()
+
+    if policy == "keep-consistent":
+        report.loc[report["discordant"], "action"] = "drop"
+        drop_cols = [feat for feat in discordant_features if feat in out_train_int.columns or feat in out_train_ext.columns]
+        out_train_int = out_train_int.drop(columns=drop_cols, errors="ignore")
+        out_test_int = out_test_int.drop(columns=drop_cols, errors="ignore")
+        out_train_ext = out_train_ext.drop(columns=drop_cols, errors="ignore")
+        out_test_ext = out_test_ext.drop(columns=drop_cols, errors="ignore")
+        print(f"[FEATURE DIRECTION] Dropped {len(drop_cols)} discordant feature(s): {drop_cols}")
+    elif policy == "invert-discordant":
+        report.loc[report["discordant"], "action"] = f"invert_{invert_cohort}"
+        targets = (
+            (out_train_int, out_test_int)
+            if invert_cohort == "internal"
+            else (out_train_ext, out_test_ext)
+        )
+        for df in targets:
+            for feat in discordant_features:
+                if feat in df.columns:
+                    df.loc[:, feat] = -pd.to_numeric(df[feat], errors="coerce")
+        print(f"[FEATURE DIRECTION] Inverted {len(discordant_features)} discordant feature(s) in {invert_cohort}: {discordant_features}")
+    else:
+        print("[FEATURE DIRECTION] Policy 'none': report only; no feature values changed.")
+
+    os.makedirs(out_dir, exist_ok=True)
+    report_path = os.path.join(out_dir, f"feature_direction_consistency__{policy}.csv")
+    report.to_csv(report_path, index=False)
+    print(f"[FEATURE DIRECTION] Saved train-set feature direction report to {report_path}")
+    return out_train_int, out_test_int, out_train_ext, out_test_ext, report
 
 
 def _add_patient_table_label(row: Dict[str, object], patient_table: str) -> Dict[str, object]:
@@ -1007,12 +1259,9 @@ def run_base_experiments(
     hyperparameter_tuning: bool = True,
     tune_combined: bool = True,
     fi_dir: str = os.path.join("outputs", "feature_importance", "feature_importance_bundles"),
-    use_feature_selection: bool = True,
+    use_feature_selection: bool = False,
     run_feature_alignment: bool = False,
     feature_alignment_method: str = "meanstd",
-    feature_alignment_coral_shrinkage: float = 0.1,
-    feature_alignment_coral_eig_floor: float = 1e-6,
-    feature_alignment_quantile_n_quantiles: int = 201,
     repeat_test_seeds: int = 1,
 ) -> None:
     summary_rows: List[Dict[str, object]] = []
@@ -1314,16 +1563,12 @@ def run_base_experiments(
         print(f"\n[ALIGN] Running train-only patient-level feature alignment experiments with method={feature_alignment_method}...")
 
         label_int_to_ext = f"aligned_BOMI2_to_BOMI1_{feature_alignment_method}"
-        label_ext_to_int = f"aligned_BOMI1_to_BOMI2_{feature_alignment_method}"
 
         align_int_to_ext = fit_feature_alignment(
             df_train_int,
             df_train_ext,
             feat_cols,
             method=feature_alignment_method,
-            coral_shrinkage=feature_alignment_coral_shrinkage,
-            coral_eig_floor=feature_alignment_coral_eig_floor,
-            quantile_n_quantiles=feature_alignment_quantile_n_quantiles,
         )
         df_train_int_aligned = apply_feature_alignment(df_train_int, feat_cols, align_int_to_ext, method=feature_alignment_method)
         df_test_int_aligned = apply_feature_alignment(df_test_int, feat_cols, align_int_to_ext, method=feature_alignment_method)
@@ -1348,7 +1593,7 @@ def run_base_experiments(
                 feat_cols=feat_cols,
             )
         )
-        auc_i_align, _, acc_i_align, _, _, _, pipe_i_align, _ = run_classification_cv(
+        auc_i_align, _, acc_i_align, _, _, model_name_i_align, pipe_i_align, _ = run_classification_cv(
             df_train_int_aligned,
             n_folds=5,
             hyperparameter_tuning=hyperparameter_tuning,
@@ -1366,16 +1611,16 @@ def run_base_experiments(
             eval_dict=eval_i_align_on_int_test,
             cohort="BOMI2",
             regime=f"{label_int_to_ext}__train_internal__test_internal",
-            model_name=str(model_name_i),
+            model_name=str(model_name_i_align),
         )
         _save_repeated_holdout_outputs(
             eval_dict=eval_i_align_on_ext_test,
             cohort="BOMI2",
             regime=f"{label_int_to_ext}__train_internal__test_external",
-            model_name=str(model_name_i),
+            model_name=str(model_name_i_align),
         )
-        _record_repeated_holdout(label_int_to_ext, "BOMI2", "BOMI2", model_name_i, eval_i_align_on_int_test)
-        _record_repeated_holdout(label_int_to_ext, "BOMI2", "BOMI1", model_name_i, eval_i_align_on_ext_test)
+        _record_repeated_holdout(label_int_to_ext, "BOMI2", "BOMI2", model_name_i_align, eval_i_align_on_int_test)
+        _record_repeated_holdout(label_int_to_ext, "BOMI2", "BOMI1", model_name_i_align, eval_i_align_on_ext_test)
         summary_rows.append(
             _add_patient_table_label(
                 _make_summary_row(
@@ -1425,7 +1670,7 @@ def run_base_experiments(
 
         combined_train_i_align = pd.concat([df_train_int_aligned, df_train_ext_pref], ignore_index=True, sort=False)
         if tune_combined:
-            _, _, _, _, _, _, pipe_ci_align, _ = run_classification_cv(
+            _, _, _, _, _, model_name_ci_align, pipe_ci_align, _ = run_classification_cv(
                 combined_train_i_align,
                 n_folds=5,
                 hyperparameter_tuning=hyperparameter_tuning,
@@ -1434,6 +1679,7 @@ def run_base_experiments(
             )
         else:
             pipe_ci_align = pipe_i_align
+            model_name_ci_align = model_name_i_align
         auc_ci_align, _, acc_ci_align, _ = run_combined_cv_target_cohort(
             df_train_int=df_train_int_aligned,
             df_train_ext_pref=df_train_ext_pref,
@@ -1458,16 +1704,16 @@ def run_base_experiments(
             eval_dict=eval_ci_align_on_int_test,
             cohort="COMBINED",
             regime=f"{label_int_to_ext}__train_combined__test_internal",
-            model_name=str(model_name_c),
+            model_name=str(model_name_ci_align),
         )
         _save_repeated_holdout_outputs(
             eval_dict=eval_ci_align_on_ext_test,
             cohort="COMBINED",
             regime=f"{label_int_to_ext}__train_combined__test_external",
-            model_name=str(model_name_c),
+            model_name=str(model_name_ci_align),
         )
-        _record_repeated_holdout(label_int_to_ext, "COMBINED", "BOMI2", model_name_c, eval_ci_align_on_int_test)
-        _record_repeated_holdout(label_int_to_ext, "COMBINED", "BOMI1", model_name_c, eval_ci_align_on_ext_test)
+        _record_repeated_holdout(label_int_to_ext, "COMBINED", "BOMI2", model_name_ci_align, eval_ci_align_on_int_test)
+        _record_repeated_holdout(label_int_to_ext, "COMBINED", "BOMI1", model_name_ci_align, eval_ci_align_on_ext_test)
         summary_rows.append(
             _add_patient_table_label(
                 _make_summary_row(
@@ -1483,177 +1729,6 @@ def run_base_experiments(
                     bomi1_test_auc=eval_ci_align_on_ext_test["auc"],
                 ),
                 patient_table=label_int_to_ext,
-            )
-        )
-
-        align_ext_to_int = fit_feature_alignment(
-            df_train_ext,
-            df_train_int,
-            feat_cols,
-            method=feature_alignment_method,
-            coral_shrinkage=feature_alignment_coral_shrinkage,
-            coral_eig_floor=feature_alignment_coral_eig_floor,
-            quantile_n_quantiles=feature_alignment_quantile_n_quantiles,
-        )
-        df_train_ext_aligned = apply_feature_alignment(df_train_ext, feat_cols, align_ext_to_int, method=feature_alignment_method)
-        df_test_ext_aligned = apply_feature_alignment(df_test_ext, feat_cols, align_ext_to_int, method=feature_alignment_method)
-        alignment_diag_rows.append(
-            {
-                "Patient table": label_ext_to_int,
-                "source": "BOMI1",
-                "target": "BOMI2",
-                "method": feature_alignment_method,
-                "domain_auc_train_before": _cohort_domain_auc(df_train_ext, df_train_int, feat_cols),
-                "domain_auc_train_after": _cohort_domain_auc(df_train_ext_aligned, df_train_int, feat_cols),
-            }
-        )
-        alignment_shift_rows.extend(
-            _feature_shift_rows(
-                patient_table=label_ext_to_int,
-                source_name="BOMI1",
-                target_name="BOMI2",
-                source_before=df_train_ext,
-                source_after=df_train_ext_aligned,
-                target_df=df_train_int,
-                feat_cols=feat_cols,
-            )
-        )
-        eval_i_on_ext_train_aligned = evaluate_fast(df_train_int, df_train_ext_aligned, clone(pipe_i))
-        eval_i_on_ext_test_aligned = evaluate_on_test_set_repeated(
-            df_train_int, df_test_ext_aligned, clone(pipe_i), repeat_test_seeds=repeat_test_seeds
-        )
-        _save_repeated_holdout_outputs(
-            eval_dict=eval_i_on_ext_test_aligned,
-            cohort="BOMI2",
-            regime=f"{label_ext_to_int}__train_internal__test_external",
-            model_name=str(model_name_i),
-        )
-        _record_repeated_holdout(label_ext_to_int, "BOMI2", "BOMI1", model_name_i, eval_i_on_ext_test_aligned)
-        summary_rows.append(
-            _add_patient_table_label(
-                _make_summary_row(
-                    bomi2_in_train=True,
-                    bomi1_in_train=False,
-                    bomi2_train_acc=acc_i,
-                    bomi2_train_auc=auc_i,
-                    bomi1_train_acc=eval_i_on_ext_train_aligned["accuracy"],
-                    bomi1_train_auc=eval_i_on_ext_train_aligned["auc"],
-                    bomi2_test_acc=eval_i2i["accuracy"],
-                    bomi2_test_auc=eval_i2i["auc"],
-                    bomi1_test_acc=eval_i_on_ext_test_aligned["accuracy"],
-                    bomi1_test_auc=eval_i_on_ext_test_aligned["auc"],
-                ),
-                patient_table=label_ext_to_int,
-            )
-        )
-
-        auc_e_align, _, acc_e_align, _, _, _, pipe_e_align, _ = run_classification_cv(
-            df_train_ext_aligned,
-            n_folds=5,
-            hyperparameter_tuning=hyperparameter_tuning,
-            return_model=True,
-            use_feature_selection=use_feature_selection,
-        )
-        eval_e_align_on_int_train = evaluate_fast(df_train_ext_aligned, df_train_int, clone(pipe_e_align))
-        eval_e_align_on_int_test = evaluate_on_test_set_repeated(
-            df_train_ext_aligned, df_test_int, clone(pipe_e_align), repeat_test_seeds=repeat_test_seeds
-        )
-        eval_e_align_on_ext_test = evaluate_on_test_set_repeated(
-            df_train_ext_aligned, df_test_ext_aligned, clone(pipe_e_align), repeat_test_seeds=repeat_test_seeds
-        )
-        _save_repeated_holdout_outputs(
-            eval_dict=eval_e_align_on_int_test,
-            cohort="BOMI1",
-            regime=f"{label_ext_to_int}__train_external__test_internal",
-            model_name=str(model_name_e),
-        )
-        _save_repeated_holdout_outputs(
-            eval_dict=eval_e_align_on_ext_test,
-            cohort="BOMI1",
-            regime=f"{label_ext_to_int}__train_external__test_external",
-            model_name=str(model_name_e),
-        )
-        _record_repeated_holdout(label_ext_to_int, "BOMI1", "BOMI2", model_name_e, eval_e_align_on_int_test)
-        _record_repeated_holdout(label_ext_to_int, "BOMI1", "BOMI1", model_name_e, eval_e_align_on_ext_test)
-        summary_rows.append(
-            _add_patient_table_label(
-                _make_summary_row(
-                    bomi2_in_train=False,
-                    bomi1_in_train=True,
-                    bomi2_train_acc=eval_e_align_on_int_train["accuracy"],
-                    bomi2_train_auc=eval_e_align_on_int_train["auc"],
-                    bomi1_train_acc=acc_e_align,
-                    bomi1_train_auc=auc_e_align,
-                    bomi2_test_acc=eval_e_align_on_int_test["accuracy"],
-                    bomi2_test_auc=eval_e_align_on_int_test["auc"],
-                    bomi1_test_acc=eval_e_align_on_ext_test["accuracy"],
-                    bomi1_test_auc=eval_e_align_on_ext_test["auc"],
-                ),
-                patient_table=label_ext_to_int,
-            )
-        )
-
-        df_train_ext_aligned_pref = _prefix_ids(df_train_ext_aligned, prefix="BOMI1_")
-        combined_train_e_align = pd.concat([df_train_int, df_train_ext_aligned_pref], ignore_index=True, sort=False)
-        if tune_combined:
-            _, _, _, _, _, _, pipe_ce_align, _ = run_classification_cv(
-                combined_train_e_align,
-                n_folds=5,
-                hyperparameter_tuning=hyperparameter_tuning,
-                return_model=True,
-                use_feature_selection=use_feature_selection,
-            )
-        else:
-            pipe_ce_align = pipe_e_align
-        auc_ci_align2, _, acc_ci_align2, _ = run_combined_cv_target_cohort(
-            df_train_int=df_train_int,
-            df_train_ext_pref=df_train_ext_aligned_pref,
-            pipeline=pipe_ce_align,
-            target="INTERNAL",
-            n_folds=5,
-        )
-        auc_ce_align2, _, acc_ce_align2, _ = run_combined_cv_target_cohort(
-            df_train_int=df_train_int,
-            df_train_ext_pref=df_train_ext_aligned_pref,
-            pipeline=pipe_ce_align,
-            target="EXTERNAL",
-            n_folds=5,
-        )
-        eval_ce_align_on_int_test = evaluate_on_test_set_repeated(
-            combined_train_e_align, df_test_int, clone(pipe_ce_align), repeat_test_seeds=repeat_test_seeds
-        )
-        eval_ce_align_on_ext_test = evaluate_on_test_set_repeated(
-            combined_train_e_align, df_test_ext_aligned, clone(pipe_ce_align), repeat_test_seeds=repeat_test_seeds
-        )
-        _save_repeated_holdout_outputs(
-            eval_dict=eval_ce_align_on_int_test,
-            cohort="COMBINED",
-            regime=f"{label_ext_to_int}__train_combined__test_internal",
-            model_name=str(model_name_c),
-        )
-        _save_repeated_holdout_outputs(
-            eval_dict=eval_ce_align_on_ext_test,
-            cohort="COMBINED",
-            regime=f"{label_ext_to_int}__train_combined__test_external",
-            model_name=str(model_name_c),
-        )
-        _record_repeated_holdout(label_ext_to_int, "COMBINED", "BOMI2", model_name_c, eval_ce_align_on_int_test)
-        _record_repeated_holdout(label_ext_to_int, "COMBINED", "BOMI1", model_name_c, eval_ce_align_on_ext_test)
-        summary_rows.append(
-            _add_patient_table_label(
-                _make_summary_row(
-                    bomi2_in_train=True,
-                    bomi1_in_train=True,
-                    bomi2_train_acc=acc_ci_align2,
-                    bomi2_train_auc=auc_ci_align2,
-                    bomi1_train_acc=acc_ce_align2,
-                    bomi1_train_auc=auc_ce_align2,
-                    bomi2_test_acc=eval_ce_align_on_int_test["accuracy"],
-                    bomi2_test_auc=eval_ce_align_on_int_test["auc"],
-                    bomi1_test_acc=eval_ce_align_on_ext_test["accuracy"],
-                    bomi1_test_auc=eval_ce_align_on_ext_test["auc"],
-                ),
-                patient_table=label_ext_to_int,
             )
         )
 
@@ -1723,11 +1798,41 @@ def build_argparser() -> argparse.ArgumentParser:
         default=1,
         help="Repeat each fixed holdout test evaluation across N consecutive seeds and report mean ± SEM.",
     )
+    p.add_argument(
+        "--nested-cv-only",
+        action="store_true",
+        help="Run the INTERNAL/mIF nested CV and skip the rest of the base experiments.",
+    )
+    p.add_argument("--nested-outer-folds", type=int, default=5)
+    p.add_argument("--nested-inner-folds", type=int, default=3)
+    p.add_argument(
+        "--nested-cv-out-dir",
+        type=str,
+        default=os.path.join("outputs", "metrics", "nested_cv"),
+        help="Output directory for nested-CV summary, fold metrics, and out-of-fold predictions.",
+    )
     p.add_argument("--run-feature-alignment", action="store_true")
-    p.add_argument("--feature-alignment-method", type=str, default="meanstd", choices=["meanstd", "robust_iqr", "quantile", "coral"])
-    p.add_argument("--feature-alignment-coral-shrinkage", type=float, default=0.1)
-    p.add_argument("--feature-alignment-coral-eig-floor", type=float, default=1e-6)
-    p.add_argument("--feature-alignment-quantile-n-quantiles", type=int, default=201)
+    p.add_argument("--feature-alignment-method", type=str, default="meanstd", choices=["meanstd", "median_iqr"])
+    p.add_argument(
+        "--feature-direction-policy",
+        type=str,
+        default="none",
+        choices=FEATURE_DIRECTION_POLICIES,
+        help=(
+            "Train-set-only handling for features whose LUAD-vs-LUSC direction differs "
+            "between internal and external cohorts."
+        ),
+    )
+    p.add_argument(
+        "--feature-direction-invert-cohort",
+        type=str,
+        default="internal",
+        choices=["internal", "external"],
+        help=(
+            "Cohort to multiply by -1 for discordant features when "
+            "--feature-direction-policy=invert-discordant."
+        ),
+    )
     p.add_argument("--no-tune-combined", action="store_true")
     p.add_argument(
         "--fi-dir",
@@ -1770,6 +1875,35 @@ def main() -> None:
         external_xy_scale=args.external_xy_scale,
     )
 
+    df_train_int, df_test_int, df_train_ext, df_test_ext, _ = apply_feature_direction_policy(
+        df_train_int,
+        df_test_int,
+        df_train_ext,
+        df_test_ext,
+        args.feature_direction_policy,
+        invert_cohort=args.feature_direction_invert_cohort,
+    )
+
+    if args.nested_cv_only:
+        print("\n[NESTED CV] INTERNAL/mIF model-selection estimate...")
+        nested_cv = run_nested_classification_cv(
+            df_train_int,
+            outer_folds=args.nested_outer_folds,
+            inner_folds=args.nested_inner_folds,
+            hyperparameter_tuning=hyperparameter_tuning,
+            use_feature_selection=use_feature_selection,
+        )
+        save_nested_cv_outputs(nested_cv, cohort="BOMI2", out_dir=args.nested_cv_out_dir)
+        print(
+            "[NESTED CV] BOMI2 train estimate: "
+            f"AUC={nested_cv['auc_mean']:.3f} ± {nested_cv['auc_std']:.3f} SD "
+            f"(SEM={nested_cv['auc_sem']:.3f}), "
+            f"Acc={nested_cv['accuracy_mean']:.3f} ± {nested_cv['accuracy_std']:.3f} SD"
+        )
+        if args.nested_cv_only:
+            print("[INFO] --nested-cv-only set; skipping base experiments.")
+            return
+
     run_base_experiments(
         df_train_int=df_train_int,
         df_test_int=df_test_int,
@@ -1781,9 +1915,6 @@ def main() -> None:
         use_feature_selection=use_feature_selection,
         run_feature_alignment=args.run_feature_alignment,
         feature_alignment_method=args.feature_alignment_method,
-        feature_alignment_coral_shrinkage=args.feature_alignment_coral_shrinkage,
-        feature_alignment_coral_eig_floor=args.feature_alignment_coral_eig_floor,
-        feature_alignment_quantile_n_quantiles=args.feature_alignment_quantile_n_quantiles,
         repeat_test_seeds=args.repeat_test_seeds,
     )
 
@@ -1791,22 +1922,16 @@ def main() -> None:
         learning_fit_alignment_fn = None
         learning_apply_alignment_fn = None
         learning_alignment_method = None
-        learning_alignment_kwargs = None
 
         if args.run_feature_alignment:
-            if args.feature_alignment_method not in {"meanstd", "robust_iqr"}:
+            if args.feature_alignment_method not in {"meanstd", "median_iqr"}:
                 raise ValueError(
                     "--run-learning-curve currently supports --run-feature-alignment only for "
-                    "'meanstd' and 'robust_iqr'."
+                    "'meanstd' and 'median_iqr'."
                 )
             learning_fit_alignment_fn = fit_feature_alignment
             learning_apply_alignment_fn = apply_feature_alignment
             learning_alignment_method = args.feature_alignment_method
-            learning_alignment_kwargs = {
-                "coral_shrinkage": args.feature_alignment_coral_shrinkage,
-                "coral_eig_floor": args.feature_alignment_coral_eig_floor,
-                "quantile_n_quantiles": args.feature_alignment_quantile_n_quantiles,
-            }
 
         if args.learning_train_sizes_internal.strip():
             sizes_int = parse_train_sizes(args.learning_train_sizes_internal, n_train=len(df_train_int))
@@ -1844,7 +1969,7 @@ def main() -> None:
             fit_feature_alignment_fn=learning_fit_alignment_fn,
             apply_feature_alignment_fn=learning_apply_alignment_fn,
             feature_alignment_method=learning_alignment_method,
-            feature_alignment_kwargs=learning_alignment_kwargs,
+            feature_alignment_kwargs=None,
             n_jobs=args.n_jobs,
         )
 

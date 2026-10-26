@@ -1,0 +1,31 @@
+# Python caches
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# Editor backups and local scratch files
+*~
+\#*\#
+
+# Local environments and OS noise
+.DS_Store
+.env
+.venv/
+venv/
+
+# Generated analysis artifacts
+outputs/
+data/interim/
+data/processed/
+archive/editor_backups/
+
+# Transitional root-level outputs from older scripts
+comparison_results*.csv
+comparison_results*.png
+pred_*.csv
+spatial_metrics*.csv
+external_*predictions*.csv
+external_spatial_metrics*.csv
+feature_correlations.csv
+feature_correlations.png
+cohort_mixing_summary.csv

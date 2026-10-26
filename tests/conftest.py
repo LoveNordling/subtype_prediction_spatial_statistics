@@ -28,13 +28,20 @@ def stub_spatial_utils_module() -> types.ModuleType:
 @pytest.fixture
 def stub_spatial_metrics_module() -> types.ModuleType:
     module = types.ModuleType("spatial_metrics")
+    module.BEHANOVA_FEATURE_COLUMNS = (
+        "cancer_ripley_L_auc",
+        "stroma_ripley_L_auc",
+        "newmans_assortativity",
+    )
     module.calculate_ripley_l = lambda *args, **kwargs: {}
-    module.calculate_bidirectional_min_distance = lambda *args, **kwargs: {}
+    module.calculate_ripley_l_curve = lambda *args, **kwargs: {}
     module.calculate_newmans_assortativity = lambda *args, **kwargs: 0.0
     module.calculate_centrality_scores = lambda *args, **kwargs: {}
+    module.calculate_cell_type_cooccurrence_ratio = lambda *args, **kwargs: {}
     module.calculate_cluster_cooccurrence_ratio = lambda *args, **kwargs: {}
     module.calculate_neighborhood_enrichment_test = lambda *args, **kwargs: {}
-    module.calculate_objectobject_correlation = lambda *args, **kwargs: {}
+    module.calculate_object_object_correlation = lambda *args, **kwargs: {}
+    module.calculate_behanova_spatial_metrics = lambda *args, **kwargs: {}
     return module
 
 
